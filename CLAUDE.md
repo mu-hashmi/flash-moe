@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 flash-moe enables large MoE (Mixture-of-Experts) models to run on memory-constrained Macs by loading only router-selected experts on demand from SSD, rather than keeping all experts in Metal GPU memory. Target: run a 46GB model on a 32GB Mac at ≥3 tok/s.
 
-The approach is based on Apple's "LLM in a Flash" paper. The target model is Qwen3-Coder-Next-4bit (48 MoE layers, 512 experts per layer, top-10 routing).
+The approach draws from Apple's "LLM in a Flash" and more recent research (MoEpic, FloE, FlashMoE, ActiveFlow). The target model is Qwen3-Coder-Next-4bit (48 MoE layers, 512 experts per layer, top-10 routing). See the full updated proposal in Obsidian: `flash-moe/updated project document.md`.
 
 ## Two-Repo Setup
 
@@ -85,7 +85,10 @@ Model → Qwen3NextModel → layers[0..47] → Qwen3NextDecoderLayer
 - 144 `mx.load` header parses per token
 - Full expert tensor disk reads (no caching of recently-used experts)
 
-**Next phases:** Expert caching (Phase 2), async prefetch (Phase 3), LLM-in-a-Flash optimizations (Phase 4).
+**Next phases:**
+- Phase 2: Expert cache with LCP policy (`P = μ × ρ^(ν/ω)`, not LRU — LRU evicts experts reused 34% of the time)
+- Phase 3: Expert split (cache top θ of each expert, load bottom on demand) + speculative prefetch (run next layer's router on current hidden state) + data layout optimization
+- Phase 4: ML-based cache (FlashMoE), intra-expert sparsity (FloE), per-layer adaptive budgets (MoEpic)
 
 ## MLX Internals to Know
 
