@@ -78,17 +78,46 @@ Model → Qwen3NextModel → layers[0..47] → Qwen3NextDecoderLayer
 - **`benchmarks/`** — Phase 1 benchmarks: I/O throughput, cache verification, madvise prefetch, pipeline prototyping
 - **`analysis/`** — Expert reuse analysis, cache simulation, viability calculation
 
-## Current Status and Known Limitations
+## Current Status
 
-**Phase 1 complete** — lazy loading works, memory reduced from ~40 GB to ~2.4 GB peak. But generation speed is ~0.1 tok/s due to:
-- 48 `mx.eval` sync points per token (one per MoE layer)
-- 144 `mx.load` header parses per token
-- Full expert tensor disk reads (no caching of recently-used experts)
+**Phase 3 complete. Predictive zero-eval mode: 19.2 tok/s at 256 experts/layer (23 GB).**
 
-**Next phases:**
-- Phase 2: Expert cache with LCP policy (`P = μ × ρ^(ν/ω)`, not LRU — LRU evicts experts reused 34% of the time)
-- Phase 3: Expert split (cache top θ of each expert, load bottom on demand) + speculative prefetch (run next layer's router on current hidden state) + data layout optimization
-- Phase 4: ML-based cache (FlashMoE), intra-expert sparsity (FloE), per-layer adaptive budgets (MoEpic)
+| Phase | Speed | Memory | Status |
+|-------|-------|--------|--------|
+| 1: Lazy loading | 0.15 tok/s | 2.4 GB | Done |
+| 2: LCP cache | 0.17 tok/s | 23 GB | Done (bottlenecked by tensor assembly) |
+| 2.5: Predictive cache | **19.2 tok/s** | 23 GB | Done (zero-eval forward pass) |
+| 3: Delta warmup | 19.2 tok/s | 23 GB | Done (scatter-based rebuild) |
+| 3.5: Fast delta warmup | 19.2 tok/s | 23 GB | Done (42-55s cross-domain, ~2x faster) |
+
+### Delta Warmup Performance (cross-domain switch)
+
+`fast_delta_warmup()` in lazy_experts.py — best: **42s**, typical: 45-55s (vs 70-94s full re-warmup).
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| Discovery (predictive) | 0.9-1.5s | Through zero-eval predictive cache |
+| Shard I/O (9 shards) | ~15s | Physical I/O floor, already optimal |
+| Scatter eval (batched) | 25-37s | Metal buffer throughput limit (~72 GB traffic) |
+
+**Router-only discovery rejected**: 40% overlap (router_only_forward), 74% overlap (speculative_router_probe) but 7-47s runtime — slower than predictive discovery at 1.3s.
+
+**Cross-domain switches affect all 48 layers** (15-53 missing experts/layer). Skip-layers optimization only helps for same-domain switches.
+
+**Next work:**
+- Lower capacity experiments (128 experts → half Metal traffic → faster scatter eval)
+- Same-domain delta warmup benchmarks (expect skip-layers to help there)
+- Expert split (Phase 4) — cache top fraction permanently, load rest on demand
+- Speculative prefetch — run next layer's router on current hidden state
+
+## Measurement Discipline
+
+- Before reporting benchmark results, explicitly state what was verified vs assumed
+- Use `sudo purge` before EVERY cold I/O trial; verify with `fs_usage`
+- Micro-benchmark projections must enumerate ALL pipeline costs before extrapolating
+- Always run full end-to-end tests, not just isolated operations
+- Validate measurements against proxy signals (high fallback rate should produce garbled output; if it reports 0% but output is garbled, the measurement is wrong)
+- When comparing approaches, note run order — first run pays cold disk cache penalty
 
 ## MLX Internals to Know
 
@@ -96,3 +125,7 @@ Model → Qwen3NextModel → layers[0..47] → Qwen3NextDecoderLayer
 - `__setattr__`: if value is `mx.array|dict|list|tuple` → stored in dict (visible to `parameters()`); else → `super().__setattr__()` (hidden)
 - This is why `LazyQuantizedSwitchLinear` stores only Python str/int — `parameters()` sees nothing, so `mx.eval(model.parameters())` skips expert weights
 - `gather_qmm()` is the key MLX op for quantized expert dispatch
+- **Buffer donation:** `x = dict.pop(key); x[idx] = val; dict[key] = x` enables zero-copy scatter (20x faster than list decompose + mx.stack)
+- **Never cache `mx.load()` dicts** — holds lazy refs that pin full tensors in memory → OOM
+- **Never `mx.eval()` inside forward pass** — breaks async_eval pipeline (2.2x slowdown)
+- **Eval per-layer during rebuilds** — deferring eval across 48 layers causes OOM (old+new coexist)
