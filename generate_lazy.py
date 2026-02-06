@@ -9,6 +9,7 @@ Usage (run from the mlx-lm venv):
 
 Modes:
     predictive      (default) — Warmup with LCP cache, then zero-eval forward pass.
+    delta-warmup    — Warmup on default prompt, delta-update cache for actual prompt.
     sync-predictive — Same as predictive but WITH mx.eval per layer (benchmark control).
     cached          — Phase 2 eval-based LCP cache.
     lazy            — Phase 1 no-cache loading (capacity ignored).
@@ -18,7 +19,10 @@ import sys
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from mlx_lm.lazy_experts import enable_lazy_experts, upgrade_to_predictive, get_cache_stats
+from mlx_lm.lazy_experts import (
+    enable_lazy_experts, upgrade_to_predictive, get_cache_stats,
+    get_fallback_stats, delta_warmup,
+)
 
 MODEL = "mlx-community/Qwen3-Coder-Next-4bit"
 WARMUP_TOKENS = 10
@@ -43,6 +47,11 @@ def main():
         print(f"Expert loading mode: cached (capacity={cache_capacity})")
         replaced = enable_lazy_experts(model, model_path,
                                        cache_capacity_per_layer=cache_capacity)
+    elif mode == "delta-warmup":
+        print(f"Expert loading mode: delta-warmup (capacity={cache_capacity})")
+        replaced = enable_lazy_experts(model, model_path,
+                                       cache_capacity_per_layer=cache_capacity,
+                                       predictive=True)
     elif mode in ("predictive", "sync-predictive"):
         print(f"Expert loading mode: {mode} (capacity={cache_capacity})")
         replaced = enable_lazy_experts(model, model_path,
@@ -60,7 +69,24 @@ def main():
     mx.eval(model.parameters())
     print(f"Non-expert params loaded. Metal memory: {mx.get_active_memory() / 1e9:.1f} GB")
 
-    if mode in ("predictive", "sync-predictive"):
+    if mode == "delta-warmup":
+        default_prompt = "Write a hello world program in Python"
+        print(f"\nWarmup: generating {WARMUP_TOKENS} tokens on default prompt...")
+        mlx_lm.generate(model, tokenizer, prompt=default_prompt,
+                        max_tokens=WARMUP_TOKENS, verbose=False)
+        print(f"\nUpgrading to predictive cache (capacity={cache_capacity})...")
+        upgraded = upgrade_to_predictive(model, model_path, cache_capacity)
+        print(f"Upgraded {upgraded} modules")
+        print(f"Metal memory after upgrade: {mx.get_active_memory() / 1e9:.1f} GB")
+
+        print(f"\nDelta warmup for actual prompt...")
+        stats = delta_warmup(model, tokenizer, model_path, prompt)
+        print(f"  Discovery: {stats['discovery_time']:.2f}s")
+        print(f"  Rebuild: {stats['rebuild_time']:.2f}s")
+        print(f"  Swaps: {stats['total_swaps']} ({stats['total_missing']} missing)")
+        print(f"  Total: {stats['total_time']:.2f}s")
+
+    elif mode in ("predictive", "sync-predictive"):
         print(f"\nWarmup: generating {WARMUP_TOKENS} tokens to discover expert routing...")
         mlx_lm.generate(model, tokenizer, prompt=prompt,
                         max_tokens=WARMUP_TOKENS, verbose=False)
@@ -84,6 +110,11 @@ def main():
     )
 
     print(f"\nFinal Metal memory: {mx.get_active_memory() / 1e9:.1f} GB")
+
+    if mode in ("predictive", "sync-predictive", "delta-warmup"):
+        fb = get_fallback_stats(model)
+        print(f"Fallback rate: {fb['fallback_rate']:.1%} "
+              f"({fb['total_fallbacks']}/{fb['total_requests']})")
 
     if mode == "cached":
         stats = get_cache_stats(model)
