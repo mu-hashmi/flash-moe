@@ -28,7 +28,13 @@ from mlx_lm.lazy_experts import (
     get_cache_stats,
     dynamic_cache_update,
     get_fallback_stats,
+    delta_warmup,
+    adaptive_capacity_upgrade,
+    reset_to_cached,
     CachedQuantizedSwitchLinear,
+    PredictiveCachedSwitchLinear,
+    SyncPredictiveCachedSwitchLinear,
+    measure_fallback,
 )
 
 MODEL = "mlx-community/Qwen3-Coder-Next-4bit"
@@ -288,6 +294,258 @@ def experiment_memory():
         print(f"Memory growth (first → last sample): {growth:+.2f} GB")
 
 
+def experiment_delta_warmup():
+    """Compare delta warmup vs cross-prompt vs full re-warmup."""
+    model, tokenizer, model_path = load_model()
+
+    prompt_a = "Write a Python function that implements binary search on a sorted list."
+    prompt_b = "用中文详细解释什么是动态规划算法，并用Python实现一个背包问题的解法。"
+    gen_tokens = 50
+
+    # --- Step 1: Baseline — warmup on prompt A, generate prompt A ---
+    print("=" * 60)
+    print("Step 1: Baseline — warmup on prompt A, generate prompt A")
+    print("=" * 60)
+    setup_predictive(model, tokenizer, model_path, prompt_a,
+                     warmup_tokens=10, capacity=CAPACITY)
+
+    # Reset counters
+    _reset_fallback_counters(model)
+    tic = time.perf_counter()
+    text_a = mlx_lm.generate(model, tokenizer, prompt=prompt_a,
+                              max_tokens=gen_tokens, verbose=False)
+    t_baseline = time.perf_counter() - tic
+    fb_a = measure_fallback(model)
+    print(f"Output: {text_a[:150]}...")
+    print(f"Speed: {gen_tokens / t_baseline:.1f} tok/s")
+    print(f"Fallback: {fb_a['fallback_rate']:.1%}")
+    print(f"Memory: {mx.get_active_memory() / 1e9:.1f} GB\n")
+
+    # --- Step 2: Cross-prompt — prompt A's cache for prompt B ---
+    print("=" * 60)
+    print("Step 2: Cross-prompt — prompt A's cache for prompt B (no delta warmup)")
+    print("=" * 60)
+    _reset_fallback_counters(model)
+    tic = time.perf_counter()
+    text_cross = mlx_lm.generate(model, tokenizer, prompt=prompt_b,
+                                  max_tokens=gen_tokens, verbose=False)
+    t_cross = time.perf_counter() - tic
+    fb_cross = measure_fallback(model)
+    print(f"Output: {text_cross[:150]}...")
+    print(f"Speed: {gen_tokens / t_cross:.1f} tok/s")
+    print(f"Fallback: {fb_cross['fallback_rate']:.1%}\n")
+
+    # --- Step 3: Delta warmup for prompt B, then generate ---
+    print("=" * 60)
+    print("Step 3: Delta warmup — update cache for prompt B, then generate")
+    print("=" * 60)
+    delta_stats = delta_warmup(model, tokenizer, model_path, prompt_b,
+                               discovery_tokens=10)
+    print(f"Discovery: {delta_stats['discovery_time']:.2f}s")
+    print(f"Rebuild: {delta_stats['rebuild_time']:.2f}s")
+    print(f"Total delta warmup: {delta_stats['total_time']:.2f}s")
+    print(f"Swaps: {delta_stats['total_swaps']} ({delta_stats['total_missing']} missing)")
+
+    tic = time.perf_counter()
+    text_delta = mlx_lm.generate(model, tokenizer, prompt=prompt_b,
+                                  max_tokens=gen_tokens, verbose=False)
+    t_delta = time.perf_counter() - tic
+    fb_delta = measure_fallback(model)
+    print(f"Output: {text_delta[:150]}...")
+    print(f"Speed: {gen_tokens / t_delta:.1f} tok/s")
+    print(f"Fallback: {fb_delta['fallback_rate']:.1%}")
+    print(f"Memory: {mx.get_active_memory() / 1e9:.1f} GB\n")
+
+    # --- Step 4: Full re-warmup for comparison ---
+    print("=" * 60)
+    print("Step 4: Full re-warmup — reset → warmup → upgrade for prompt B")
+    print("=" * 60)
+    tic_rw = time.perf_counter()
+    reset_to_cached(model, model_path, CAPACITY)
+    mlx_lm.generate(model, tokenizer, prompt=prompt_b,
+                     max_tokens=10, verbose=False)
+    upgrade_to_predictive(model, model_path, CAPACITY)
+    t_rewarmup = time.perf_counter() - tic_rw
+
+    _reset_fallback_counters(model)
+    tic = time.perf_counter()
+    text_full = mlx_lm.generate(model, tokenizer, prompt=prompt_b,
+                                 max_tokens=gen_tokens, verbose=False)
+    t_full = time.perf_counter() - tic
+    fb_full = measure_fallback(model)
+    print(f"Re-warmup time: {t_rewarmup:.1f}s")
+    print(f"Output: {text_full[:150]}...")
+    print(f"Speed: {gen_tokens / t_full:.1f} tok/s")
+    print(f"Fallback: {fb_full['fallback_rate']:.1%}\n")
+
+    # --- Summary ---
+    print("=" * 80)
+    print(f"{'Method':<20} {'Warmup':>8} {'Gen':>6} {'Total':>8} {'tok/s':>6} {'FB%':>6}")
+    print("-" * 80)
+    print(f"{'Baseline (A→A)':<20} {'—':>8} {t_baseline:>5.1f}s {'—':>8} "
+          f"{gen_tokens/t_baseline:>6.1f} {fb_a['fallback_rate']:>5.1%}")
+    print(f"{'Cross (A→B)':<20} {'—':>8} {t_cross:>5.1f}s {'—':>8} "
+          f"{gen_tokens/t_cross:>6.1f} {fb_cross['fallback_rate']:>5.1%}")
+    print(f"{'Delta warmup':<20} {delta_stats['total_time']:>7.1f}s {t_delta:>5.1f}s "
+          f"{delta_stats['total_time']+t_delta:>7.1f}s "
+          f"{gen_tokens/t_delta:>6.1f} {fb_delta['fallback_rate']:>5.1%}")
+    print(f"{'Full re-warmup':<20} {t_rewarmup:>7.1f}s {t_full:>5.1f}s "
+          f"{t_rewarmup+t_full:>7.1f}s "
+          f"{gen_tokens/t_full:>6.1f} {fb_full['fallback_rate']:>5.1%}")
+    print("=" * 80)
+
+
+def experiment_adaptive():
+    """Compare uniform vs adaptive per-layer capacity."""
+    total_budget = 48 * 256
+    prompt = "Write a Python function that implements binary search on a sorted list."
+    gen_tokens = 50
+
+    # --- Uniform-256 baseline ---
+    print("=" * 60)
+    print(f"Uniform capacity: 256/layer ({total_budget} total experts)")
+    print("=" * 60)
+    model, tokenizer, model_path = load_model()
+    setup_predictive(model, tokenizer, model_path, prompt,
+                     warmup_tokens=10, capacity=256)
+    uniform_mem = mx.get_active_memory() / 1e9
+
+    _reset_fallback_counters(model)
+    tic = time.perf_counter()
+    mlx_lm.generate(model, tokenizer, prompt=prompt,
+                     max_tokens=gen_tokens, verbose=False)
+    t_uniform = time.perf_counter() - tic
+    fb_uniform = get_fallback_stats(model)
+    print(f"Memory: {uniform_mem:.1f} GB")
+    print(f"Speed: {gen_tokens / t_uniform:.1f} tok/s")
+    print(f"Fallback: {fb_uniform['fallback_rate']:.1%}")
+
+    del model
+    mx.clear_cache()
+
+    # --- Adaptive capacity ---
+    print(f"\n{'='*60}")
+    print(f"Adaptive capacity: {total_budget} total budget, min=32/layer")
+    print(f"{'='*60}")
+    model, tokenizer, model_path = load_model()
+    enable_lazy_experts(model, model_path, cache_capacity_per_layer=512,
+                        predictive=True)
+    mx.eval(model.parameters())
+    print(f"Non-expert params: {mx.get_active_memory() / 1e9:.1f} GB")
+
+    print(f"Warmup: 10 tokens...")
+    mlx_lm.generate(model, tokenizer, prompt=prompt,
+                     max_tokens=10, verbose=False)
+
+    print(f"Adaptive upgrade (budget={total_budget}, min=32)...")
+    result = adaptive_capacity_upgrade(model, model_path, total_budget,
+                                        min_per_layer=32)
+    adaptive_mem = mx.get_active_memory() / 1e9
+
+    _reset_fallback_counters(model)
+    tic = time.perf_counter()
+    mlx_lm.generate(model, tokenizer, prompt=prompt,
+                     max_tokens=gen_tokens, verbose=False)
+    t_adaptive = time.perf_counter() - tic
+    fb_adaptive = get_fallback_stats(model)
+    print(f"Memory: {adaptive_mem:.1f} GB")
+    print(f"Speed: {gen_tokens / t_adaptive:.1f} tok/s")
+    print(f"Fallback: {fb_adaptive['fallback_rate']:.1%}")
+    print(f"Total experts: {result['total_experts']}")
+
+    # Per-layer breakdown
+    caps = sorted(result['allocations'].values())
+    print(f"\nPer-layer capacity: min={min(caps)} median={caps[len(caps)//2]} max={max(caps)}")
+    discs = sorted(result['discovered'].values())
+    print(f"Per-layer discovered: min={min(discs)} median={discs[len(discs)//2]} max={max(discs)}")
+
+    print(f"\n{'Layer':>6} {'Discovered':>10} {'Allocated':>10}")
+    print("-" * 30)
+    for layer_idx in sorted(result['allocations']):
+        disc = result['discovered'][layer_idx]
+        alloc = result['allocations'][layer_idx]
+        print(f"{layer_idx:>6} {disc:>10} {alloc:>10}")
+
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"{'Method':<15} {'Memory':>8} {'tok/s':>6} {'FB%':>6} {'Experts':>8}")
+    print(f"{'-'*60}")
+    print(f"{'Uniform-256':<15} {uniform_mem:>7.1f}G {gen_tokens/t_uniform:>6.1f} "
+          f"{fb_uniform['fallback_rate']:>5.1%} {48*256:>8}")
+    print(f"{'Adaptive':<15} {adaptive_mem:>7.1f}G {gen_tokens/t_adaptive:>6.1f} "
+          f"{fb_adaptive['fallback_rate']:>5.1%} {result['total_experts']:>8}")
+    savings = uniform_mem - adaptive_mem
+    print(f"Memory savings: {savings:+.1f} GB")
+    print(f"{'='*60}")
+
+
+def _reset_fallback_counters(model):
+    for layer in model.layers:
+        if not hasattr(layer, "mlp") or not hasattr(layer.mlp, "switch_mlp"):
+            continue
+        proj = getattr(layer.mlp.switch_mlp, "up_proj", None)
+        if isinstance(proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
+            proj._cache.total_requests = 0
+            proj._cache.total_fallbacks = 0
+            proj._cache._indices_buffer.clear()
+
+
+def experiment_memory_predictive():
+    """Memory growth in pure predictive mode (prompt-aware warmup, no dynamic updates)."""
+    model, tokenizer, model_path = load_model()
+    prompt = (
+        "Write a detailed tutorial on building a web server in Python from scratch, "
+        "covering sockets, HTTP parsing, routing, middleware, and deployment"
+    )
+
+    # Prompt-aware warmup
+    setup_predictive(model, tokenizer, model_path, prompt, warmup_tokens=10, capacity=CAPACITY)
+
+    baseline_active = mx.get_active_memory() / 1e9
+    baseline_peak = mx.get_peak_memory() / 1e9
+    print(f"Baseline: active={baseline_active:.2f} GB, peak={baseline_peak:.2f} GB")
+
+    max_tokens = 500
+    print(f"\nGenerating {max_tokens} tokens (no dynamic updates)...")
+    mem_samples = [{"token": 0, "active_gb": baseline_active,
+                    "peak_gb": baseline_peak, "delta_gb": 0, "tok_s": 0}]
+    text = ""
+    tic = time.perf_counter()
+
+    for response in stream_generate(model, tokenizer, prompt, max_tokens=max_tokens):
+        text += response.text
+        n = response.generation_tokens
+        if n % 50 == 0:
+            active = mx.get_active_memory() / 1e9
+            peak = mx.get_peak_memory() / 1e9
+            delta = active - baseline_active
+            tps = n / (time.perf_counter() - tic)
+            mem_samples.append({"token": n, "active_gb": active, "peak_gb": peak,
+                                "delta_gb": delta, "tok_s": tps})
+            print(f"  Token {n:>4}: active={active:.2f} GB  peak={peak:.2f} GB  "
+                  f"delta={delta:+.2f} GB  {tps:.1f} tok/s")
+            if active > 30:
+                print("  *** WARNING: Approaching Metal memory limit! ***")
+
+    total_time = time.perf_counter() - tic
+    final_tps = response.generation_tokens / total_time
+
+    fallback_stats = get_fallback_stats(model)
+
+    print(f"\n{'='*70}")
+    print(f"{'Token':>6} {'Active GB':>10} {'Peak GB':>10} {'Delta GB':>10} {'tok/s':>8}")
+    print(f"{'-'*70}")
+    for s in mem_samples:
+        print(f"{s['token']:>6} {s['active_gb']:>10.2f} {s['peak_gb']:>10.2f} "
+              f"{s['delta_gb']:>+10.2f} {s['tok_s']:>8.1f}")
+    print(f"{'='*70}")
+    print(f"Final: {response.generation_tokens} tokens in {total_time:.1f}s ({final_tps:.1f} tok/s)")
+    print(f"Fallback rate: {fallback_stats['fallback_rate']:.1%}")
+    growth = mem_samples[-1]["delta_gb"]
+    print(f"Memory growth: {growth:+.2f} GB over {max_tokens} tokens")
+    print(f"Per-token growth: {growth * 1024 / max_tokens:.2f} MB/token")
+
+
 def experiment_expert_size():
     """Verify per-expert memory footprint from tensor shapes."""
     model_path = hf_repo_to_path(MODEL)
@@ -335,6 +593,9 @@ EXPERIMENTS = {
     "quality": experiment_quality,
     "warmup": experiment_warmup,
     "memory": experiment_memory,
+    "memory-predictive": experiment_memory_predictive,
+    "delta-warmup": experiment_delta_warmup,
+    "adaptive": experiment_adaptive,
     "expert-size": experiment_expert_size,
 }
 
