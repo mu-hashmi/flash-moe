@@ -70,12 +70,12 @@ Per-call `mx.load()` in Phase 2 is intentional — fancy indexing materializes f
 
 **Warmup optimization complete.** Results in `warmup_optim.md` (Obsidian vault).
 
-**Recommended config for 32 GB Mac:** 208 capacity + pinning + cache_limit(0). 19.1 GB, 8.7 tok/s, coherent through 1000 tokens. **6s warm start, 13s cold start.**
+**Recommended config for 32 GB Mac:** 208 capacity + pinning + wired_limit + cache=256MB. 19.0 GB, ~23 tok/s (200-tok burst). **6s warm start, 13s cold start.**
 
 **3 models validated:** Qwen3-Coder-Next-4bit, Mixtral-8x7B-Instruct-4bit, GLM-4.7-Flash-4bit.
 
 **What's implemented:**
-- `flash_generate()` — one-call API with auto capacity, cache persistence, pinning, prepacked weights, memory guards
+- `flash_generate()` — one-call API with auto capacity, cache persistence, pinning, wired residency, prepacked weights, memory guards
 - `router_only_discovery()` — 76x faster cold-start discovery (76s → 1s) via batched eval
 - `save_prepacked_weights()` / `load_prepacked_weights()` — skip upgrade_to_predictive on warm start (14.8s → 3.9s)
 - `upgrade_from_profile()` — profile-based cold start, skip discovery entirely
@@ -87,7 +87,7 @@ Per-call `mx.load()` in Phase 2 is intentional — fancy indexing materializes f
 
 **Known limitations:**
 - Quality cliff: capacity <192 produces garbled output
-- Metal pressure cliff: capacity >208 triggers 3x eval degradation (cache_limit(0) pushes to 240)
+- Metal pressure cliff: capacity >208 triggers 3x eval degradation (set_wired_limit does NOT extend ceiling)
 - Mild sentence-level repetition persists at 1000+ tokens (model capacity limitation, not flash-moe)
 
 ## Next Work
@@ -105,6 +105,8 @@ Per-call `mx.load()` in Phase 2 is intentional — fancy indexing materializes f
 - **Eval per-layer during rebuilds** — deferred eval across 48 layers causes OOM
 - **Buffer donation pattern:** `x = dict.pop(key); x[idx] = val; dict[key] = x` — 20x faster scatter
 - **Micro-benchmarks lie under memory pressure** — 200x gap vs full model. Always validate end-to-end.
-- **`mx.metal.set_cache_limit(0)`** before heavy ops reclaims several GB headroom
-- **`mx.metal.get_cache_limit()` does NOT exist** — restore with `device_info()["memory_size"] // 4`
+- **`mx.set_cache_limit(0)`** before heavy ops reclaims several GB headroom
+- **`mx.get_cache_limit()` does NOT exist** — restore with `device_info()["memory_size"] // 4`
+- **`mx.set_wired_limit(bytes)`** — pins Metal buffers in physical RAM via MTLResidencySet (macOS 15+, no-ops on older). Call after model+cache are loaded to prevent OS paging during generation.
 - **MLX NOT thread-safe** for GPU eval — cooperative single-thread only
+- **`sudo sysctl iogpu.wired_limit_mb=28672`** — raises GPU memory cap from ~75% to ~88% of RAM. Doesn't persist across reboots. Risk of OS instability.

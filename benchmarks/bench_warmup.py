@@ -50,7 +50,7 @@ def run_config(name, capacity, model_path, profile_path=None, opts=None):
     """Run one warmup configuration, return timing dict."""
     opts = opts or {}
     gc.collect()
-    mx.metal.clear_cache()
+    mx.clear_cache()
 
     timings = {}
 
@@ -70,7 +70,7 @@ def run_config(name, capacity, model_path, profile_path=None, opts=None):
         enable_lazy_experts(model, model_path, cache_capacity_per_layer=capacity, predictive=True)
         mx.eval(model.parameters())
     timings["enable_lazy"] = time.perf_counter() - t0
-    mem_base = mx.metal.get_active_memory() / 1e9
+    mem_base = mx.get_active_memory() / 1e9
     print(f"  Lazy enabled + params eval'd: {timings['enable_lazy']:.1f}s ({mem_base:.1f} GB)")
 
     # Phase 3: discovery (config-dependent)
@@ -96,14 +96,14 @@ def run_config(name, capacity, model_path, profile_path=None, opts=None):
         else:
             upgrade_to_predictive(model, model_path, capacity)
     timings["upgrade"] = time.perf_counter() - t0
-    mem_after_upgrade = mx.metal.get_active_memory() / 1e9
+    mem_after_upgrade = mx.get_active_memory() / 1e9
     print(f"  Upgrade: {timings['upgrade']:.1f}s ({mem_after_upgrade:.1f} GB)")
 
     # Phase 5: verify with short generation
     t0 = time.perf_counter()
     text = mlx_lm.generate(model, tokenizer, prompt=PROMPT, max_tokens=20, verbose=False)
     timings["gen_20tok"] = time.perf_counter() - t0
-    mem_final = mx.metal.get_active_memory() / 1e9
+    mem_final = mx.get_active_memory() / 1e9
     print(f"  20-token gen: {timings['gen_20tok']:.1f}s ({mem_final:.1f} GB)")
     print(f"  Output: {text[:80]}...")
 
@@ -116,7 +116,7 @@ def run_config(name, capacity, model_path, profile_path=None, opts=None):
 
     del model
     gc.collect()
-    mx.metal.clear_cache()
+    mx.clear_cache()
 
     return timings
 
