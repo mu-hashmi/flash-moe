@@ -1,0 +1,92 @@
+{
+  "model": "mlx-community/Qwen3-Coder-Next-4bit",
+  "device_gb": 34.359738368,
+  "gen_tokens": 200,
+  "prompt": "Write a Python function that implements binary search on a sorted array.",
+  "configs": [
+    {
+      "name": "baseline (no wire)",
+      "capacity": 208,
+      "wire": false,
+      "wired_gb": 0.0,
+      "cache_bytes": 0,
+      "startup_s": 31.1,
+      "active_gb": 19.02,
+      "peak_gb": 23.05,
+      "gen_tps": 15.89,
+      "gen_elapsed_s": 12.58,
+      "gen_peak_gb": 19.1,
+      "gen_active_gb": 19.04
+    },
+    {
+      "name": "wired",
+      "capacity": 208,
+      "wire": true,
+      "wired_gb": 19.02,
+      "cache_bytes": 0,
+      "startup_s": 5.82,
+      "active_gb": 19.02,
+      "peak_gb": 19.1,
+      "gen_tps": 19.28,
+      "gen_elapsed_s": 10.37,
+      "gen_peak_gb": 19.1,
+      "gen_active_gb": 19.04
+    },
+    {
+      "name": "wired cap=224",
+      "capacity": 224,
+      "wire": true,
+      "wired_gb": 19.02,
+      "cache_bytes": 0,
+      "startup_s": 6.65,
+      "active_gb": 19.02,
+      "peak_gb": 19.1,
+      "gen_tps": 15.84,
+      "gen_elapsed_s": 12.63,
+      "gen_peak_gb": 19.1,
+      "gen_active_gb": 19.04
+    },
+    {
+      "name": "wired cap=240",
+      "capacity": 240,
+      "wire": true,
+      "wired_gb": 19.02,
+      "cache_bytes": 0,
+      "startup_s": 5.52,
+      "active_gb": 19.02,
+      "peak_gb": 19.1,
+      "gen_tps": 19.38,
+      "gen_elapsed_s": 10.32,
+      "gen_peak_gb": 19.1,
+      "gen_active_gb": 19.04
+    },
+    {
+      "name": "cache=0 (current)",
+      "capacity": 208,
+      "wire": true,
+      "wired_gb": 19.02,
+      "cache_bytes": 0,
+      "startup_s": 27.78,
+      "active_gb": 19.02,
+      "peak_gb": 23.05,
+      "gen_tps": 20.57,
+      "gen_elapsed_s": 9.73,
+      "gen_peak_gb": 19.1,
+      "gen_active_gb": 19.04
+    },
+    {
+      "name": "cache=256MB",
+      "capacity": 208,
+      "wire": true,
+      "wired_gb": 19.02,
+      "cache_bytes": 268435456,
+      "startup_s": 29.81,
+      "active_gb": 19.02,
+      "peak_gb": 23.05,
+      "gen_tps": 23.44,
+      "gen_elapsed_s": 8.53,
+      "gen_peak_gb": 19.1,
+      "gen_active_gb": 19.04
+    }
+  ]
+}
