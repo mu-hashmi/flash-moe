@@ -1,0 +1,57 @@
+{
+  "model": "mlx-community/Qwen3-Coder-Next-4bit",
+  "capacity": 208,
+  "profile_path": "PATH_REMOVED",
+  "configs": {
+    "baseline": {
+      "model_load": 2.401364666002337,
+      "enable_lazy": 0.723703249997925,
+      "discovery": 76.22801854100544,
+      "upgrade": 14.810683833027724,
+      "gen_20tok": 95.96755933301756,
+      "mem_base": 1.357549064,
+      "mem_final": 19.026765362,
+      "total": 94.16377029003343
+    },
+    "router-only": {
+      "model_load": 1.3646635000477545,
+      "enable_lazy": 0.4722895000013523,
+      "discovery": 0.9508959999657236,
+      "upgrade": 14.48273558402434,
+      "gen_20tok": 28.68114137504017,
+      "mem_base": 1.357549066,
+      "mem_final": 19.026766802,
+      "total": 17.27058458403917
+    },
+    "profile-based": {
+      "model_load": 1.4000179590075277,
+      "enable_lazy": 0.4736053750384599,
+      "discovery": 2.3339525796473026e-06,
+      "upgrade": 11.048095708014444,
+      "gen_20tok": 16.290658209007233,
+      "mem_base": 1.357549066,
+      "mem_final": 19.026767666,
+      "total": 12.92172137601301
+    },
+    "combined-cold": {
+      "model_load": 1.2874554159934632,
+      "enable_lazy": 0.4403781250002794,
+      "discovery": 1.458043698221445e-06,
+      "upgrade": 32.80250337498728,
+      "gen_20tok": 1.6678112920490094,
+      "mem_base": 1.357549066,
+      "mem_final": 19.026765938,
+      "total": 34.53033837402472
+    },
+    "prepacked-warm": {
+      "model_load": 1.4051190830068663,
+      "enable_lazy": 0.5206459159962833,
+      "discovery": 8.749775588512421e-07,
+      "upgrade": 3.8522749170078896,
+      "gen_20tok": 5.845996499992907,
+      "mem_base": 1.357549066,
+      "mem_final": 19.02676565,
+      "total": 5.778040790988598
+    }
+  }
+}
