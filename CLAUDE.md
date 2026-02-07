@@ -129,3 +129,5 @@ Model → Qwen3NextModel → layers[0..47] → Qwen3NextDecoderLayer
 - **Never cache `mx.load()` dicts** — holds lazy refs that pin full tensors in memory → OOM
 - **Never `mx.eval()` inside forward pass** — breaks async_eval pipeline (2.2x slowdown)
 - **Eval per-layer during rebuilds** — deferring eval across 48 layers causes OOM (old+new coexist)
+- **Batched eval (EVAL_BATCH=8-10)** — middle ground between per-layer (safe but slow, 48 sync points) and deferred (OOM). Cuts rebuild time ~2.5x by amortizing Metal command buffer overhead.
+- **Micro-benchmarks lie under memory pressure** — isolated scatter: 2.5ms/layer. Full model at 30 GB: 0.5-0.8s/layer (200x gap). Always validate with end-to-end tests at realistic memory load.
