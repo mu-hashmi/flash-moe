@@ -80,7 +80,7 @@ Model → Qwen3NextModel → layers[0..47] → Qwen3NextDecoderLayer
 
 ## Current Status
 
-**Phase 3 complete. Predictive zero-eval mode: 19.2 tok/s at 256 experts/layer (23 GB).**
+**Phase 4 complete. Async delta warmup: 8.2 tok/s streaming, 17.7 GB, swaps complete in 7.5s.**
 
 | Phase | Speed | Memory | Status |
 |-------|-------|--------|--------|
@@ -88,27 +88,43 @@ Model → Qwen3NextModel → layers[0..47] → Qwen3NextDecoderLayer
 | 2: LCP cache | 0.17 tok/s | 23 GB | Done (bottlenecked by tensor assembly) |
 | 2.5: Predictive cache | **19.2 tok/s** | 23 GB | Done (zero-eval forward pass) |
 | 3: Delta warmup | 19.2 tok/s | 23 GB | Done (scatter-based rebuild) |
-| 3.5: Fast delta warmup | 19.2 tok/s | 23 GB | Done (42-55s cross-domain, ~2x faster) |
+| 3.5: Fast delta warmup | 19.2 tok/s | 23 GB | Done (42-55s cross-domain at 256 cap) |
+| 4: Async delta warmup | **8.2 tok/s** | 17.7 GB | Done (lazy scatter, no pipeline stall) |
 
-### Delta Warmup Performance (cross-domain switch)
+### Capacity Selection (192 is the sweet spot)
 
-`fast_delta_warmup()` in lazy_experts.py — best: **42s**, typical: 45-55s (vs 70-94s full re-warmup).
+| Capacity | Memory | Quality | Delta Warmup | Post-Delta Speed |
+|----------|--------|---------|-------------|-----------------|
+| 128 | 12.3 GB | Garbled (too few experts) | 11s | 22 tok/s |
+| **192** | **17.7 GB** | **Coherent** | **59s blocking / 7.5s async** | **16.7 tok/s** |
+| 256 | 23.2 GB | Coherent | 42-86s | 4.6-16.6 tok/s |
+
+128 capacity produces repetitive/garbled output even after delta warmup — insufficient expert coverage. 256 capacity hits the Metal memory pressure cliff (23 GB of 32 GB). **192 is the optimal capacity**: coherent output, 17.7 GB (under the ~20 GB pressure cliff), and fast enough scatter eval for async delta warmup.
+
+### Async Delta Warmup (IncrementalDeltaWarmup)
+
+`IncrementalDeltaWarmup` in lazy_experts.py — generates immediately while swapping experts between tokens.
 
 | Component | Time | Notes |
 |-----------|------|-------|
-| Discovery (predictive) | 0.9-1.5s | Through zero-eval predictive cache |
-| Shard I/O (9 shards) | ~15s | Physical I/O floor, already optimal |
-| Scatter eval (batched) | 25-37s | Metal buffer throughput limit (~72 GB traffic) |
+| Discovery | ~8s | 10-token generation through stale cache |
+| Swaps complete | 7.5s (at token 24) | 2 layers per token, all lazy |
+| Overall throughput | 8.2 tok/s | 100 tokens in 12.2s |
 
-**Router-only discovery rejected**: 40% overlap (router_only_forward), 74% overlap (speculative_router_probe) but 7-47s runtime — slower than predictive discovery at 1.3s.
+How it works: after discovery, `step()` builds lazy scatter graphs (mx.load → index → pop+scatter → lookup update, zero mx.eval). The next forward pass evaluates the scatter naturally. No pipeline serialization, no threading.
 
-**Cross-domain switches affect all 48 layers** (15-53 missing experts/layer). Skip-layers optimization only helps for same-domain switches.
+### Metal Memory Pressure Cliff
+
+Per-swap scatter eval: **1.07ms at 12 GB** vs **18-26ms at 23 GB** (17-24x degradation). The cliff is between ~20-22 GB on a 32 GB Mac. `recommendedMaxWorkingSetSize` ≈ 24 GB, and batched eval transiently exceeds this. **Rule: keep base occupancy under 20 GB.**
+
+### MLX Thread Safety
+
+MLX is NOT thread-safe for concurrent GPU eval. Default stream is a global singleton, not thread-local. Background thread `mx.eval` crashes with Metal assertion failures (issues #2067, #2133). The async delta warmup uses cooperative single-thread lazy scatter instead.
 
 **Next work:**
-- Lower capacity experiments (128 experts → half Metal traffic → faster scatter eval)
-- Same-domain delta warmup benchmarks (expect skip-layers to help there)
-- Expert split (Phase 4) — cache top fraction permanently, load rest on demand
+- Expert split (Phase 5) — cache top fraction permanently, load rest on demand
 - Speculative prefetch — run next layer's router on current hidden state
+- Deeper discovery (>10 tokens) to improve expert coverage at lower capacities
 
 ## Measurement Discipline
 
