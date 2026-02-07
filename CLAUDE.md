@@ -28,6 +28,9 @@ Target model: Qwen3-Coder-Next-4bit (48 MoE layers, 512 experts/layer, top-10 ro
 
 # Pinning benchmark (4 configs × 1000 tokens)
 /Users/muhash/mlx-lm/.venv/bin/python benchmarks/bench_pinning.py [profile.json] [capacity] [max_tokens]
+
+# Warmup optimization benchmark (5 configs)
+/Users/muhash/mlx-lm/.venv/bin/python benchmarks/bench_warmup.py [profile_path] [capacity]
 ```
 
 For mlx-lm changes, work from `/Users/muhash/mlx-lm/` on the `lazy-experts` branch.
@@ -54,39 +57,46 @@ layers[0..47] → Qwen3NextDecoderLayer
 
 1. `enable_lazy_experts(model, model_path, capacity, predictive=True)` replaces `QuantizedSwitchLinear` modules (144 total)
 2. `mx.eval(model.parameters())` loads only non-expert weights (~1.4 GB)
-3. Warmup: generate 10 tokens to discover expert routing
-4. `upgrade_to_predictive(model, model_path, capacity)` pre-loads top experts into GPU tensors
-5. Generation uses zero-eval forward pass with pre-stacked expert lookup tables
+3. Expert discovery (one of):
+   - **Prepacked warm start** (~4s): `load_prepacked_weights()` from saved safetensors
+   - **Profile-based cold start** (~11s): `upgrade_from_profile()` using universal expert profile
+   - **Router-only discovery** (~1s discovery + ~15s upgrade): `router_only_discovery()` then `upgrade_to_predictive()`
+   - Legacy: full 10-token generation (~76s discovery + ~15s upgrade)
+4. Generation uses zero-eval forward pass with pre-stacked expert lookup tables
 
-Per-call `mx.load()` is intentional — fancy indexing materializes full source tensors, so fresh lazy refs each call prevents OOM.
+Per-call `mx.load()` in Phase 2 is intentional — fancy indexing materializes full source tensors, so fresh lazy refs each call prevents OOM.
 
 ## Current Status
 
-**Pre-production sweep complete.** Results in `pre_prod_sweep.md` (Obsidian vault).
+**Warmup optimization complete.** Results in `warmup_optim.md` (Obsidian vault).
 
-**Recommended config for 32 GB Mac:** 208 capacity + pinning + cache_limit(0). 19.1 GB, 8.7 tok/s, coherent through 1000 tokens.
+**Recommended config for 32 GB Mac:** 208 capacity + pinning + cache_limit(0). 19.1 GB, 8.7 tok/s, coherent through 1000 tokens. **6s warm start, 13s cold start.**
+
+**3 models validated:** Qwen3-Coder-Next-4bit, Mixtral-8x7B-Instruct-4bit, GLM-4.7-Flash-4bit.
 
 **What's implemented:**
-- `upgrade_to_predictive_with_pinning()` — pins universal experts, fixes 300-token degradation (rep 0.20→0.03)
-- `generate_persistent.py` — cache persistence, 60s warm start (was 155s cold)
-- `async-delta-coherent` mode — buffers stale tokens, streams from first coherent token
+- `flash_generate()` — one-call API with auto capacity, cache persistence, pinning, prepacked weights, memory guards
+- `router_only_discovery()` — 76x faster cold-start discovery (76s → 1s) via batched eval
+- `save_prepacked_weights()` / `load_prepacked_weights()` — skip upgrade_to_predictive on warm start (14.8s → 3.9s)
+- `upgrade_from_profile()` — profile-based cold start, skip discovery entirely
+- `upgrade_to_predictive_with_pinning()` — pins universal experts, fixes 300-token degradation
 - `_find_switch_mlp()` + `_detect_num_experts()` — supports Qwen + Mixtral + GLM model families
+- `_load_proj_experts()` — format-agnostic expert loading (stacked + per-expert + cross-shard)
 - `dynamic_cache_update()` wired into generation loop with configurable refresh interval
 - `compute_adaptive_allocations()` — MoEpic greedy per-layer budget
-- `dynamic_cache_update_ml()` — ML eviction scorer (untrained)
 
 **Known limitations:**
-- Cold start: 60s with cache persistence (12s upgrade), 155s without
 - Quality cliff: capacity <192 produces garbled output
 - Metal pressure cliff: capacity >208 triggers 3x eval degradation (cache_limit(0) pushes to 240)
 - Mild sentence-level repetition persists at 1000+ tokens (model capacity limitation, not flash-moe)
 
 ## Next Work
 
-- Test on GLM-4.7-Flash-4bit and Mixtral-8x7B-Instruct-4bit (validate generalization)
-- Per-layer adaptive budget (profiling done, compute allocations)
-- Cache persistence + pinning integration (save universal profile path in cache state JSON)
-- Train ML eviction models (low priority)
+- Per-layer adaptive budget (profiling done, compute allocations implemented)
+- Profile pinning on Mixtral/GLM (run profile_experts.py on non-Qwen models)
+- Streaming flash_generate variant for chat applications
+- Upstream to mlx-lm (lazy-experts branch needs PR or plugin architecture)
+- Test DeepSeek, Hunyuan, PhiMoE (_find_switch_mlp() lists support but untested)
 
 ## MLX Pitfalls (project-specific)
 
