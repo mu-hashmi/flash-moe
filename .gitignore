@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Skill files (local Claude Code config)
+*.skill
