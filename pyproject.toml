@@ -8,4 +8,13 @@ dependencies = [
     "mlx>=0.22.0",
     "mlx-lm>=0.30.0",
     "numpy>=2.0.0",
+    "starlette>=0.46.0",
+    "uvicorn>=0.34.0",
 ]
+
+[project.scripts]
+flash-moe = "flash_moe.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
