@@ -1,12 +1,11 @@
 [project]
 name = "flash-moe"
 version = "0.1.0"
-description = "Add your description here"
+description = "Run large MoE models on memory-constrained Macs via on-demand expert loading"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "gguf>=0.17.1",
-    "numpy>=2.4.2",
-    "pyobjc-framework-metal>=12.1",
-    "pyobjc-framework-metalkit>=12.1",
+    "mlx>=0.22.0",
+    "mlx-lm>=0.30.0",
+    "numpy>=2.0.0",
 ]

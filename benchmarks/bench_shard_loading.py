@@ -16,7 +16,7 @@ from collections import defaultdict
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from mlx_lm.lazy_experts import (
+from flash_moe.lazy_experts import (
     enable_lazy_experts, _build_shard_map, PredictiveExpertCache,
     CachedQuantizedSwitchLinear, PredictiveCachedSwitchLinear,
     SyncPredictiveCachedSwitchLinear, get_cache_stats,

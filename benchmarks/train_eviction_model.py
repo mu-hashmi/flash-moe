@@ -21,7 +21,7 @@ import mlx.optimizers as optim
 import mlx_lm
 import numpy as np
 from mlx_lm.utils import hf_repo_to_path
-from mlx_lm.lazy_experts import (
+from flash_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, reset_to_cached,
     PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear,
 )

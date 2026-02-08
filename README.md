@@ -2,8 +2,6 @@
 
 Run large Mixture-of-Experts models on memory-constrained Macs by loading only router-selected experts on demand from SSD. A 46 GB Qwen3-Coder-Next model runs on a 32 GB Mac at 6-23 tok/s using 17-19 GB, with coherent output through 1000+ tokens via universal expert pinning.
 
-Built on [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm). Requires a local fork of mlx-lm with the `lazy-experts` branch.
-
 ## Hardware Requirements
 
 | System RAM | Capacity | Est. Memory | tok/s | Notes |
@@ -33,31 +31,25 @@ Both stacked safetensors (Qwen) and per-expert safetensors (Mixtral, GLM) format
 ## Quick Start
 
 ```bash
-# 1. Clone and set up mlx-lm fork
-git clone https://github.com/<your-fork>/mlx-lm.git
-cd mlx-lm && git checkout lazy-experts
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# 2. Clone flash-moe
-git clone https://github.com/<your-fork>/flash-moe.git
-
-# 3. Generate (auto-selects capacity for your hardware)
-cd flash-moe
-/path/to/mlx-lm/.venv/bin/python -c "
-from mlx_lm.lazy_experts import flash_generate
-print(flash_generate('mlx-community/Qwen3-Coder-Next-4bit',
-                      'Write a Python hello world program',
-                      max_tokens=200))
-"
+pip install "flash-moe @ git+https://github.com/mu-hashmi/flash-moe.git"
 ```
 
-For more control, use `generate_lazy.py`:
+```python
+from flash_moe import flash_generate
 
-```bash
-# Format: generate_lazy.py [prompt] [max_tokens] [capacity] [mode]
-/path/to/mlx-lm/.venv/bin/python generate_lazy.py \
-    "Write a Flask web server" 200 208 predictive
+print(flash_generate("mlx-community/Qwen3-Coder-Next-4bit",
+                      "Write a Python hello world program",
+                      max_tokens=200))
+```
+
+For streaming:
+
+```python
+from flash_moe import flash_stream_generate
+
+for response in flash_stream_generate("mlx-community/Qwen3-Coder-Next-4bit",
+                                       "Write a Flask server", max_tokens=200):
+    print(response.text, end="", flush=True)
 ```
 
 ## How It Works
@@ -157,16 +149,15 @@ flash-moe/                          # This repo
     bench_multiturn.py              # Multi-turn session memory benchmark
     bench_warmup.py                 # Warmup optimization benchmark
 
-mlx-lm/                            # Local fork (lazy-experts branch)
-  mlx_lm/lazy_experts/             # Core implementation (sub-package)
-    __init__.py                    # Re-exports all public API
-    core.py                        # enable/upgrade/reset, cache management
-    modules.py                     # Expert cache + lazy/predictive modules
-    loading.py                     # Weight loading, shard maps, capacity
-    discovery.py                   # Router-only discovery, speculative probe
-    warmup.py                      # Delta warmup, incremental warmup
-    persistence.py                 # Cache state save/load, prepacked weights
-    generate.py                    # flash_generate one-call API
+  flash_moe/
+    lazy_experts/                  # Core implementation (vendored)
+      core.py                      # enable/upgrade/reset, cache management
+      modules.py                   # Expert cache + lazy/predictive modules
+      loading.py                   # Weight loading, shard maps, capacity
+      discovery.py                 # Router-only discovery, speculative probe
+      warmup.py                    # Delta warmup, incremental warmup
+      persistence.py               # Cache state save/load, prepacked weights
+      generate.py                  # flash_generate one-call API
 ```
 
 ## API Reference
@@ -174,7 +165,7 @@ mlx-lm/                            # Local fork (lazy-experts branch)
 ### One-Call API
 
 ```python
-from mlx_lm.lazy_experts import flash_generate
+from flash_moe import flash_generate
 
 text = flash_generate(
     "mlx-community/Qwen3-Coder-Next-4bit",
@@ -191,7 +182,7 @@ text = flash_generate(
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from mlx_lm.lazy_experts import (
+from flash_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, get_fallback_stats
 )
 
@@ -254,7 +245,7 @@ sudo sysctl -d iogpu.wired_limit_mb  # removes override
 For token-by-token streaming (chat UIs, coding agents):
 
 ```python
-from generate_streaming import flash_stream_generate
+from flash_moe import flash_stream_generate
 
 for response in flash_stream_generate(
     "mlx-community/Qwen3-Coder-Next-4bit",

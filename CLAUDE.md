@@ -6,10 +6,10 @@ flash-moe enables large MoE models to run on memory-constrained Macs by loading 
 
 Target model: Qwen3-Coder-Next-4bit (48 MoE layers, 512 experts/layer, top-10 routing).
 
-## Two-Repo Setup
+## Setup
 
-- **`PATH_REMOVED (this repo) — Benchmarks, analysis, `generate_lazy.py`. Uses uv, Python 3.13.
-- **`PATH_REMOVED (local fork, `lazy-experts` branch) — Core implementation in `mlx_lm/lazy_experts/` sub-package. Has its own `.venv`.
+- **`PATH_REMOVED (this repo) — Self-contained package. Core in `flash_moe/lazy_experts/`. Depends on stock `mlx-lm>=0.30.0` (no fork needed).
+- **`PATH_REMOVED (local fork, `lazy-experts` branch) — Development mirror of `flash_moe/lazy_experts/`. Keep in sync when making core changes.
 
 ## Commands
 

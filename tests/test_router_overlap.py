@@ -22,7 +22,7 @@ import numpy as np
 
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from mlx_lm.lazy_experts import (
+from flash_moe.lazy_experts import (
     enable_lazy_experts,
     router_only_forward,
     speculative_router_probe,
