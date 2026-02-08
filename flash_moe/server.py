@@ -10,13 +10,6 @@ from pathlib import Path
 MAX_TOKENS_CAP = 4096
 MAX_INPUT_TOKENS = 16384
 
-# Tools to keep when compressing Claude Code's 55-tool payload.
-# These are the core coding tools — everything else is dropped.
-ESSENTIAL_TOOLS = {"Bash", "Read", "Write", "Edit", "Glob", "Grep"}
-
-# Max characters to keep from the system prompt
-MAX_SYSTEM_CHARS = 2000
-
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
@@ -24,7 +17,6 @@ from starlette.routing import Route
 
 from .lazy_experts.generate import FlashSession
 
-# Unbuffered stdout so tmux/pipe captures output immediately
 import sys
 if not sys.stdout.isatty():
     import functools
@@ -103,47 +95,6 @@ def _format_messages(messages: list, system: str | None = None) -> list:
     return formatted
 
 
-def _filter_tools(tools: list) -> list:
-    """Keep only essential tools, drop the rest."""
-    return [t for t in tools if t.get("name") in ESSENTIAL_TOOLS]
-
-
-def _minimize_tools(tools: list) -> list:
-    """Strip verbose descriptions from tool schemas to save tokens.
-
-    Claude Code tool descriptions are hundreds of words each. The model only
-    needs parameter names/types to generate valid tool calls.
-    """
-    minimized = []
-    for t in tools:
-        t = dict(t)
-        # One-liner description instead of the essay
-        t["description"] = t.get("description", "").split("\n")[0][:120]
-        schema = t.get("input_schema")
-        if schema:
-            schema = dict(schema)
-            props = schema.get("properties")
-            if props:
-                stripped = {}
-                for k, v in props.items():
-                    stripped[k] = {kk: vv for kk, vv in v.items() if kk != "description"}
-                schema["properties"] = stripped
-            t["input_schema"] = schema
-        minimized.append(t)
-    return minimized
-
-
-def _truncate_system(system: str) -> str:
-    if len(system) <= MAX_SYSTEM_CHARS:
-        return system
-    # Cut at a sentence boundary near the limit
-    truncated = system[:MAX_SYSTEM_CHARS]
-    last_newline = truncated.rfind("\n")
-    if last_newline > MAX_SYSTEM_CHARS // 2:
-        truncated = truncated[:last_newline]
-    return truncated
-
-
 def _convert_tools_anthropic_to_openai(tools: list) -> list:
     """Convert Anthropic tool format to OpenAI format for chat templates."""
     return [{
@@ -157,13 +108,7 @@ def _convert_tools_anthropic_to_openai(tools: list) -> list:
 
 
 def _sampling_kwargs(body: dict) -> dict:
-    """Extract sampling params from request body.
-
-    Defaults (temp=0, greedy) come from mlx-lm's make_sampler.
-    Clients should send their own values; model-specific recommendations
-    (e.g. Qwen3-Coder: temp=1.0, top_p=0.95, top_k=40) belong in the
-    client config, not the server.
-    """
+    """Extract sampling params from request body."""
     kwargs = {}
     if "temperature" in body:
         kwargs["temp"] = float(body["temperature"])
@@ -191,7 +136,9 @@ def _make_chatcmpl_id():
 
 class Server:
     def __init__(self, model_name: str, capacity: int | None = None,
-                 profile_path: str | None = None):
+                 profile_path: str | None = None,
+                 max_tokens: int = MAX_TOKENS_CAP,
+                 max_input_tokens: int = MAX_INPUT_TOKENS):
         self._model_name = model_name
         self._capacity = capacity
         self._profile_path = profile_path or _find_profile(model_name)
@@ -199,6 +146,8 @@ class Server:
         self._tokenizer = None
         self._lock = asyncio.Lock()
         self._model_id = model_name.split("/")[-1]
+        self._max_tokens = max_tokens
+        self._max_input_tokens = max_input_tokens
 
     def load(self):
         session = FlashSession(
@@ -234,6 +183,17 @@ class Server:
         parts.append("assistant:")
         return "\n".join(parts)
 
+    def _check_input_length(self, input_tokens: int):
+        if input_tokens > self._max_input_tokens:
+            return JSONResponse({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": f"Prompt too long: {input_tokens} tokens > {self._max_input_tokens} limit",
+                },
+            }, status_code=400)
+        return None
+
     async def handle_models(self, request: Request) -> JSONResponse:
         return JSONResponse({
             "object": "list",
@@ -250,7 +210,7 @@ class Server:
         raw = body.get("max_tokens")
         if raw is None:
             raw = body.get("max_completion_tokens")
-        max_tokens = min(raw if raw is not None else MAX_TOKENS_CAP, MAX_TOKENS_CAP)
+        max_tokens = min(raw if raw is not None else self._max_tokens, self._max_tokens)
         stream = body.get("stream", False)
         tools = body.get("tools")
         sampling = _sampling_kwargs(body)
@@ -259,8 +219,8 @@ class Server:
         prompt = self._tokenize_messages(formatted, tools=tools)
         input_tokens = len(self._tokenizer.encode(prompt))
 
-        if input_tokens > MAX_INPUT_TOKENS:
-            return JSONResponse({"error": {"message": f"Prompt too long: {input_tokens} tokens exceeds {MAX_INPUT_TOKENS} limit", "type": "invalid_request_error"}}, status_code=400)
+        if err := self._check_input_length(input_tokens):
+            return err
 
         print(f"  [openai] max_tokens={max_tokens} stream={stream} input_tokens={input_tokens}")
 
@@ -297,47 +257,19 @@ class Server:
             system = "\n".join(
                 b["text"] for b in system if b.get("type") == "text"
             )
-        if system:
-            system = _truncate_system(system)
-        max_tokens = min(body.get("max_tokens", MAX_TOKENS_CAP), MAX_TOKENS_CAP)
+        max_tokens = min(body.get("max_tokens", self._max_tokens), self._max_tokens)
         stream = body.get("stream", False)
         sampling = _sampling_kwargs(body)
 
         tools_anthropic = body.get("tools")
-        if tools_anthropic:
-            original_count = len(tools_anthropic)
-            tools_anthropic = _filter_tools(tools_anthropic)
-            tools_anthropic = _minimize_tools(tools_anthropic)
-            if len(tools_anthropic) != original_count:
-                print(f"  [tools] {original_count} → {len(tools_anthropic)} (kept: {[t['name'] for t in tools_anthropic]})")
         tools_openai = _convert_tools_anthropic_to_openai(tools_anthropic) if tools_anthropic else None
 
         formatted = _format_messages(messages, system=system)
         prompt = self._tokenize_messages(formatted, tools=tools_openai)
         input_tokens = len(self._tokenizer.encode(prompt))
 
-        # Claude Code sends max_tokens=1 to count input tokens — skip generation
-        if max_tokens <= 1:
-            return JSONResponse({
-                "id": _make_msg_id(),
-                "type": "message",
-                "role": "assistant",
-                "model": self._model_id,
-                "content": [{"type": "text", "text": ""}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": input_tokens, "output_tokens": 1},
-            })
-
-        if input_tokens > MAX_INPUT_TOKENS:
-            print(f"  [anthropic] REJECTED: {input_tokens} input tokens > {MAX_INPUT_TOKENS} limit")
-            return JSONResponse({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": f"Prompt too long: {input_tokens} tokens exceeds {MAX_INPUT_TOKENS} limit. "
-                               f"Reduce system prompt or tool definitions.",
-                },
-            }, status_code=400)
+        if err := self._check_input_length(input_tokens):
+            return err
 
         if not stream:
             max_tokens = min(max_tokens, 512)
@@ -567,9 +499,10 @@ class Server:
                     if resp.finish_reason == "length":
                         stop_reason = "max_tokens"
 
+            # Salvage truncated tool calls — if the model hit the token cap
+            # mid-tool-call, try to parse what we have before dropping it.
             if in_tool_call and tool_text:
                 print(f"  [WARNING: tool call truncated at {gen_tokens} tokens, {len(tool_text)} chars buffered]")
-                # Attempt to salvage: try parsing the incomplete JSON
                 try:
                     parsed = tokenizer.tool_parser(tool_text, tools)
                     if not isinstance(parsed, list):
@@ -611,16 +544,20 @@ class Server:
 
 
 def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
-               capacity: int | None = None, profile_path: str | None = None):
+               capacity: int | None = None, profile_path: str | None = None,
+               max_tokens: int = MAX_TOKENS_CAP,
+               max_input_tokens: int = MAX_INPUT_TOKENS):
     import uvicorn
     from contextlib import asynccontextmanager
 
-    server = Server(model_name, capacity=capacity, profile_path=profile_path)
+    server = Server(model_name, capacity=capacity, profile_path=profile_path,
+                    max_tokens=max_tokens, max_input_tokens=max_input_tokens)
 
     print(f"flash-moe serve")
     print(f"  Model:    {model_name}")
     print(f"  Profile:  {server._profile_path or 'none'}")
     print(f"  Endpoint: http://{host}:{port}")
+    print(f"  Limits:   {max_input_tokens} input, {max_tokens} output")
     print()
     print("Loading model...")
     server.load()
@@ -630,8 +567,6 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
 
     @asynccontextmanager
     async def lifespan(app):
-        # Re-register after uvicorn overwrites signal handlers.
-        # MLX Metal ops block the GIL, so Python's default handler can't run.
         signal.signal(signal.SIGINT, lambda *_: os._exit(0))
         yield
 

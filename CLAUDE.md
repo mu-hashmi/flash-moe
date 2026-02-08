@@ -86,28 +86,18 @@ Any MLX model using `SwitchGLU` with either module path:
 ## API Server (`flash-moe serve`)
 
 ```bash
-flash-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH]
+flash-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH] [--max-tokens N] [--max-input-tokens N]
 ```
 
 Endpoints: `/v1/chat/completions` (OpenAI), `/v1/messages` (Anthropic), `/v1/models`.
 
-### Anthropic endpoint adaptations
+Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from the request. Tool calls are parsed and converted between Anthropic and OpenAI formats. Truncated tool calls (hit token cap mid-generation) are salvage-parsed.
 
-The `/v1/messages` endpoint includes workarounds for Anthropic-protocol clients:
+### Server limits
 
-- **Token counting**: Short-circuits `max_tokens=1` requests (just tokenize, no model forward pass)
-- **Tool/prompt compression**: Filters to 6 essential tools, minimizes schemas, truncates system prompt to 2K chars
-- **Thinking tokens**: `tokenizer.has_thinking=True` inherited from Qwen3 family, but Qwen3-Coder-Next never generates them. Silently discarded as safety net.
-- **Incomplete tool calls**: Salvage-parsed if generation hits the token cap mid-tool-call
-
-### Key limits
-
-- `MAX_TOKENS_CAP = 4096` (streaming), 512 (non-streaming)
-- `MAX_INPUT_TOKENS = 16384` (rejects requests over this)
-- `MAX_SYSTEM_CHARS = 2000` (truncates system prompt)
-- `ESSENTIAL_TOOLS = {Bash, Read, Write, Edit, Glob, Grep}` (drops all others)
-- Tool schemas are minimized (descriptions stripped) to save input tokens
-- Incomplete tool calls (truncated by token cap) are salvage-parsed before dropping
+- `--max-tokens` (default 4096) — max output tokens per request, caps KV cache growth
+- `--max-input-tokens` (default 16384) — rejects requests over this
+- Non-streaming responses capped at 512 output tokens to avoid blocking
 
 ## Code Style
 
