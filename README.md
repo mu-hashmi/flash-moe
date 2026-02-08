@@ -46,6 +46,31 @@ print(session.generate('Now add type hints'))
 
 First launch downloads the model (~24 GB) and warms up experts (~13s). Subsequent launches: ~6s to first token.
 
+## API Server
+
+```bash
+flash-moe serve mlx-community/Qwen3-Coder-Next-4bit
+```
+
+Starts an OpenAI- and Anthropic-compatible API server on `http://127.0.0.1:8080`. Point any compatible client at it:
+
+```bash
+# OpenAI-compatible clients
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=flash-moe <your-client>
+
+# Anthropic-compatible clients
+ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=flash-moe <your-client>
+```
+
+Endpoints:
+- `POST /v1/chat/completions` — OpenAI chat completions (streaming and non-streaming)
+- `POST /v1/messages` — Anthropic Messages API (SSE streaming)
+- `GET /v1/models` — model discovery
+
+Options: `--port`, `--host`, `--capacity`, `--profile`.
+
+Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from the request body. Set them in your client config — the server doesn't impose model-specific defaults.
+
 ## Supported Models
 
 | Model | Experts | Top-K | MoE Layers | Memory | tok/s |
@@ -180,7 +205,8 @@ output = mlx_lm.generate(model, tokenizer, prompt="Write a Flask server",
 - **Metal pressure cliff above capacity 208** on 32 GB — 3x eval degradation
 - **Mild repetition at 1000+ tokens** — model limitation at 40% expert coverage
 - **Chat template required** for some models (GLM-4.7-Flash)
-- **Not thread-safe** — MLX GPU eval is single-threaded
+- **Not thread-safe** — MLX GPU eval is single-threaded; the server serializes requests
+- **Semaphore leak warning on Ctrl+C** — cosmetic; the `os._exit(0)` handler bypasses Python's cleanup because MLX Metal ops block the GIL
 
 ## License
 

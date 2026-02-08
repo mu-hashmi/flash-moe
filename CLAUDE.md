@@ -91,23 +91,14 @@ flash-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.
 
 Endpoints: `/v1/chat/completions` (OpenAI), `/v1/messages` (Anthropic), `/v1/models`.
 
-### Current state (in progress)
+### Anthropic endpoint adaptations
 
-Server works for basic generation. Tested with curl (both endpoints stream correctly). Claude Code integration has issues:
+The `/v1/messages` endpoint includes workarounds for Anthropic-protocol clients:
 
-- **Token counting**: Claude Code sends ~30 `max_tokens=1` requests to count tokens before the real request. Fixed: short-circuit these (just tokenize, no model forward pass, instant).
-- **OOM on large prompts**: Claude Code sends 55 tools + huge system prompt = 35K input tokens. Processing 35K tokens of KV cache on top of 19GB model = OOM on 32GB Mac. Fixed: filter to 6 essential tools (Bash, Read, Write, Edit, Glob, Grep) and truncate system prompt to 4K chars. Brings input to ~3K tokens.
-- **Thinking tokens**: `tokenizer.has_thinking=True` even though Qwen3-Coder-Next is non-thinking only (confirmed: docs say "does not generate `<think></think>` blocks", and the chat template defaults to non-thinking regardless of `enable_thinking` kwarg). The model never generates `<think>` tokens. Server silently discards them as a safety net but this is a no-op in practice.
-- **Ctrl+C doesn't work**: MLX Metal ops block the GIL. Fixed: `os._exit(0)` signal handler registered via Starlette lifespan (after uvicorn overwrites default handlers).
-- **socket.send() spam on disconnect**: Fixed: generators catch `OSError`/`CancelledError`.
-- **Sampling**: Using Qwen3-Coder-Next recommended params: `temp=1.0, top_p=0.95, top_k=40`.
-
-### Not yet tested end-to-end
-
-- Claude Code full agentic flow (tool use round-trips)
-- Tool call parsing (Qwen3-Coder → Anthropic tool_use SSE format)
-- aider / opencode integration
-- Multi-turn conversations through the server
+- **Token counting**: Short-circuits `max_tokens=1` requests (just tokenize, no model forward pass)
+- **Tool/prompt compression**: Filters to 6 essential tools, minimizes schemas, truncates system prompt to 2K chars
+- **Thinking tokens**: `tokenizer.has_thinking=True` inherited from Qwen3 family, but Qwen3-Coder-Next never generates them. Silently discarded as safety net.
+- **Incomplete tool calls**: Salvage-parsed if generation hits the token cap mid-tool-call
 
 ### Key limits
 
