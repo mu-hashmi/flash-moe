@@ -9,7 +9,7 @@ Target model: Qwen3-Coder-Next-4bit (48 MoE layers, 512 experts/layer, top-10 ro
 ## Two-Repo Setup
 
 - **`/Users/muhash/flash-moe/`** (this repo) — Benchmarks, analysis, `generate_lazy.py`. Uses uv, Python 3.13.
-- **`/Users/muhash/mlx-lm/`** (local fork, `lazy-experts` branch) — Core implementation in `mlx_lm/lazy_experts.py`. Has its own `.venv`.
+- **`/Users/muhash/mlx-lm/`** (local fork, `lazy-experts` branch) — Core implementation in `mlx_lm/lazy_experts/` sub-package. Has its own `.venv`.
 
 ## Commands
 
@@ -23,8 +23,15 @@ Target model: Qwen3-Coder-Next-4bit (48 MoE layers, 512 experts/layer, top-10 ro
 # Cache-persistent generation (skips 75s warmup on repeat runs)
 /Users/muhash/mlx-lm/.venv/bin/python generate_persistent.py <cache.json> ["prompt"] [max_tokens] [capacity]
 
-# Universal expert profiling (22 prompts, ~33 min)
-/Users/muhash/mlx-lm/.venv/bin/python benchmarks/profile_experts.py [capacity] [threshold] [output.json]
+# Universal expert profiling (22 prompts, ~33 min per model)
+/Users/muhash/mlx-lm/.venv/bin/python benchmarks/profile_experts.py --model qwen   # or mixtral, glm, or HF name
+/Users/muhash/mlx-lm/.venv/bin/python benchmarks/profile_experts.py --model mixtral --output mixtral_experts.json
+
+# Streaming generation
+/Users/muhash/mlx-lm/.venv/bin/python generate_streaming.py --model qwen --prompt "Write a Flask server" --tokens 200
+
+# Multi-turn session benchmark (memory growth + quality over N turns)
+/Users/muhash/mlx-lm/.venv/bin/python benchmarks/bench_multiturn.py --model qwen --turns 20 --tokens 200
 
 # Pinning benchmark (4 configs × 1000 tokens)
 /Users/muhash/mlx-lm/.venv/bin/python benchmarks/bench_pinning.py [profile.json] [capacity] [max_tokens]
