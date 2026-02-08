@@ -18,7 +18,11 @@ flash_moe/                  # The package (pip-installable)
     persistence.py          # Cache state save/load, prepacked weights, profiles
     generate.py             # flash_generate, flash_stream_generate, FlashSession
 
+  cli.py                    # CLI entry point: flash-moe serve
+  server.py                 # OpenAI + Anthropic API server (Starlette + uvicorn)
+
 benchmarks/                 # Profiling and benchmark scripts
+profiles/                   # Pre-computed expert profiles (auto-detected by model name)
 universal_experts.json      # Pre-computed Qwen expert profile (saves 33 min)
 ```
 
@@ -78,6 +82,41 @@ Any MLX model using `SwitchGLU` with either module path:
 - **Eval per-layer during rebuilds** — deferred eval across 48 layers causes OOM
 - **MLX is NOT thread-safe** for GPU eval — cooperative single-thread only
 - Per-call `mx.load()` in warmup is intentional — fancy indexing materializes full source tensors, so fresh lazy refs each call prevents OOM
+
+## API Server (`flash-moe serve`)
+
+```bash
+flash-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH]
+```
+
+Endpoints: `/v1/chat/completions` (OpenAI), `/v1/messages` (Anthropic), `/v1/models`.
+
+### Current state (in progress)
+
+Server works for basic generation. Tested with curl (both endpoints stream correctly). Claude Code integration has issues:
+
+- **Token counting**: Claude Code sends ~30 `max_tokens=1` requests to count tokens before the real request. Fixed: short-circuit these (just tokenize, no model forward pass, instant).
+- **OOM on large prompts**: Claude Code sends 55 tools + huge system prompt = 35K input tokens. Processing 35K tokens of KV cache on top of 19GB model = OOM on 32GB Mac. Fixed: filter to 6 essential tools (Bash, Read, Write, Edit, Glob, Grep) and truncate system prompt to 4K chars. Brings input to ~3K tokens.
+- **Thinking tokens**: `tokenizer.has_thinking=True` even though Qwen3-Coder-Next is non-thinking only (confirmed: docs say "does not generate `<think></think>` blocks", and the chat template defaults to non-thinking regardless of `enable_thinking` kwarg). The model never generates `<think>` tokens. Server silently discards them as a safety net but this is a no-op in practice.
+- **Ctrl+C doesn't work**: MLX Metal ops block the GIL. Fixed: `os._exit(0)` signal handler registered via Starlette lifespan (after uvicorn overwrites default handlers).
+- **socket.send() spam on disconnect**: Fixed: generators catch `OSError`/`CancelledError`.
+- **Sampling**: Using Qwen3-Coder-Next recommended params: `temp=1.0, top_p=0.95, top_k=40`.
+
+### Not yet tested end-to-end
+
+- Claude Code full agentic flow (tool use round-trips)
+- Tool call parsing (Qwen3-Coder → Anthropic tool_use SSE format)
+- aider / opencode integration
+- Multi-turn conversations through the server
+
+### Key limits
+
+- `MAX_TOKENS_CAP = 4096` (streaming), 512 (non-streaming)
+- `MAX_INPUT_TOKENS = 16384` (rejects requests over this)
+- `MAX_SYSTEM_CHARS = 2000` (truncates system prompt)
+- `ESSENTIAL_TOOLS = {Bash, Read, Write, Edit, Glob, Grep}` (drops all others)
+- Tool schemas are minimized (descriptions stripped) to save input tokens
+- Incomplete tool calls (truncated by token cap) are salvage-parsed before dropping
 
 ## Code Style
 
