@@ -5,39 +5,43 @@ Run large Mixture-of-Experts models on memory-constrained Macs by loading only r
 ## Quick Start
 
 ```bash
-pip install "flash-moe @ git+https://github.com/mu-hashmi/flash-moe.git"
+git clone https://github.com/mu-hashmi/flash-moe.git
+cd flash-moe
+uv sync
 ```
 
 ```python
+uv run python -c "
 from flash_moe import flash_generate
-
-print(flash_generate("mlx-community/Qwen3-Coder-Next-4bit",
-                      "Write a Python hello world program",
+print(flash_generate('mlx-community/Qwen3-Coder-Next-4bit',
+                      'Write a Python hello world program',
                       max_tokens=200))
+"
 ```
 
 Streaming:
 
 ```python
+uv run python -c "
 from flash_moe import flash_stream_generate
-
-for response in flash_stream_generate("mlx-community/Qwen3-Coder-Next-4bit",
-                                       "Write a Flask server", max_tokens=200):
-    print(response.text, end="", flush=True)
+for response in flash_stream_generate('mlx-community/Qwen3-Coder-Next-4bit',
+                                       'Write a Flask server', max_tokens=200):
+    print(response.text, end='', flush=True)
+"
 ```
 
 Multi-turn sessions:
 
 ```python
+uv run python -c "
 from flash_moe import FlashSession
-
-session = FlashSession("mlx-community/Qwen3-Coder-Next-4bit",
-                       cache_dir="~/.cache/flash-moe")
-for response in session.stream("Write a linked list in Python"):
-    print(response.text, end="", flush=True)
-
-text = session.generate("Now add type hints")
-print(text)
+session = FlashSession('mlx-community/Qwen3-Coder-Next-4bit',
+                       cache_dir='~/.cache/flash-moe')
+for response in session.stream('Write a linked list in Python'):
+    print(response.text, end='', flush=True)
+print()
+print(session.generate('Now add type hints'))
+"
 ```
 
 First launch downloads the model (~24 GB) and warms up experts (~13s). Subsequent launches: ~6s to first token.
