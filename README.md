@@ -128,16 +128,20 @@ Each MoE layer has 512 experts but only routes to 10 per token. flash-moe replac
 |--------|--------|-------|----------|-------|
 | Baseline (cap 208) | 19.1 GB | 8.8 | 0.20 | Degrades at ~250 tokens |
 | + Pinning | 19.1 GB | 8.7 | 0.03 | Coherent through 1000+ tokens |
-| + Cache persistence | 19.1 GB | 8.7 | 0.03 | 60s warm start (was 155s) |
+| + Wired limit | 19.0 GB | 10.6 | 0.03 | +21% from Metal residency |
+| + cache=256MB warmup | 19.0 GB | 12.1 | 0.03 | +14% from warmup cache floor |
+| Full optimized (burst) | 19.0 GB | ~23 | 0.03 | 200-token burst with all opts |
 | Cap 192 (safe) | 17.7 GB | 6.1 | -- | More memory headroom |
 
 ### Startup Times
 
-| Scenario | Time |
-|----------|------|
-| Cold start (first run) | 155s |
-| Warm start (cached state) | 60s |
-| Cross-domain delta warmup | ~10s |
+| Scenario | Time | Method |
+|----------|------|--------|
+| Warm start (prepacked weights) | ~6s | `load_prepacked_weights()` |
+| Cold start (with profile) | ~13s | `upgrade_from_profile()` |
+| Cold start (router-only discovery) | ~17s | `router_only_discovery()` + `upgrade_to_predictive()` |
+| Cold start (legacy full warmup) | ~94s | 10-token generation + `upgrade_to_predictive()` |
+| Cross-domain delta warmup | ~2-3s | `fast_delta_warmup()` |
 
 ## Project Structure
 
@@ -145,13 +149,24 @@ Each MoE layer has 512 experts but only routes to 10 per token. flash-moe replac
 flash-moe/                          # This repo
   generate_lazy.py                  # Main generation script
   generate_persistent.py            # Cache-persistent generation
+  generate_streaming.py             # Streaming generation wrapper
   test_generalization.py            # Multi-model smoke tests
   benchmarks/
-    profile_experts.py              # Universal expert profiling
+    profile_experts.py              # Universal expert profiling (multi-model)
     bench_pinning.py                # Pinning benchmark
+    bench_multiturn.py              # Multi-turn session memory benchmark
+    bench_warmup.py                 # Warmup optimization benchmark
 
 mlx-lm/                            # Local fork (lazy-experts branch)
-  mlx_lm/lazy_experts.py           # Core implementation (~2800 lines)
+  mlx_lm/lazy_experts/             # Core implementation (sub-package)
+    __init__.py                    # Re-exports all public API
+    core.py                        # enable/upgrade/reset, cache management
+    modules.py                     # Expert cache + lazy/predictive modules
+    loading.py                     # Weight loading, shard maps, capacity
+    discovery.py                   # Router-only discovery, speculative probe
+    warmup.py                      # Delta warmup, incremental warmup
+    persistence.py                 # Cache state save/load, prepacked weights
+    generate.py                    # flash_generate one-call API
 ```
 
 ## API Reference
@@ -200,14 +215,76 @@ print(output)
 print(get_fallback_stats(model))
 ```
 
+## Memory Budget
+
+flash-moe's working set at capacity 208 is ~19 GB on a 32 GB Mac. This leaves ~13 GB for macOS, apps, and Metal overhead. If you're running memory-heavy applications alongside (browsers with many tabs, Docker, IDEs), consider:
+
+- **Reducing capacity to 192** (17.7 GB) for more headroom
+- **Closing unnecessary apps** before long generation sessions
+- The `flash_generate()` memory guard automatically reduces capacity if projected memory exceeds 85% of device RAM
+
+## Advanced: GPU Wired Memory Limit (sysctl)
+
+macOS caps GPU-wired memory at ~75% of system RAM (`recommendedMaxWorkingSetSize`). On a 32 GB Mac this is ~24 GB. The `set_wired_limit()` call in flash-moe respects this cap.
+
+For power users who want to push beyond 75%, macOS exposes a sysctl knob:
+
+```bash
+# Raise GPU memory cap to ~88% of 32 GB RAM (WARNING: see risks below)
+sudo sysctl iogpu.wired_limit_mb=28672
+
+# Check current value
+sysctl iogpu.wired_limit_mb
+
+# Reset to default (or reboot — the setting doesn't persist)
+sudo sysctl -d iogpu.wired_limit_mb  # removes override
+```
+
+**Risks and limitations:**
+
+- **OS instability**: Starving macOS of physical RAM can cause system-wide stalls, UI freezes, or kernel panics under memory pressure. The 75% default exists for a reason.
+- **Does not persist across reboots**: Must be re-applied after every restart.
+- **Diminishing returns**: Our testing shows capacity >208 on 32 GB hits a Metal pressure cliff (3x eval degradation) regardless of the wired limit. The bottleneck shifts to Metal's internal scheduling, not RAM availability.
+- **No undo mid-session**: Once buffers are wired at the higher limit, releasing them requires stopping the process.
+
+**Recommendation**: Only use this if you have 48+ GB RAM and want to run higher capacities. On 32 GB, stick with capacity 208 — the wired limit override provides no measurable benefit.
+
+## Streaming Generation
+
+For token-by-token streaming (chat UIs, coding agents):
+
+```python
+from generate_streaming import flash_stream_generate
+
+for response in flash_stream_generate(
+    "mlx-community/Qwen3-Coder-Next-4bit",
+    "Write a Flask server",
+    max_tokens=200,
+    cache_dir="~/.cache/flash-moe",
+):
+    print(response.text, end="", flush=True)
+```
+
+Startup (model load + expert warmup) is blocking. Tokens stream after startup completes. Time to first token: ~6s warm / ~13s cold.
+
+## Multi-Turn Sessions
+
+For multi-turn use (coding agents, chatbots), reuse the model across turns. The `bench_multiturn.py` benchmark tests memory stability and generation quality over 20+ turns.
+
+```bash
+/path/to/mlx-lm/.venv/bin/python benchmarks/bench_multiturn.py --model qwen --turns 20
+```
+
+Monitors: active memory growth, generation speed drift, repetition score, and fallback rate across turns. Reports warnings if memory grows unboundedly or speed degrades.
+
 ## Known Limitations
 
-- **Cold start**: 60s minimum with cache persistence (12s tensor upgrade from disk)
 - **Quality cliff below capacity 192**: Garbled output regardless of warmup (Qwen3-Coder-Next)
-- **Metal pressure cliff above capacity 208**: 3x eval degradation on 32 GB Macs. Use `cache_limit(0)` to push to ~240
-- **Mild repetition at 1000+ tokens**: Sentence-level topic looping (model limitation, not flash-moe)
+- **Metal pressure cliff above capacity 208**: 3x eval degradation on 32 GB Macs. `set_wired_limit` does not extend this ceiling.
+- **Mild repetition at 1000+ tokens**: Sentence-level topic looping (model capacity limitation at 40% expert coverage, not flash-moe)
 - **Chat template required**: Some models (GLM-4.7-Flash) need the chat template for coherent output
 - **Not thread-safe**: MLX GPU eval is single-threaded. Use cooperative patterns, not background threads
+- **MLX version sensitivity**: Uses `mx.metal.*` (soon `mx.*`) APIs. Future MLX releases may require updates to import paths.
 
 ## License
 

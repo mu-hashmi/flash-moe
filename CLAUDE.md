@@ -9,7 +9,7 @@ Target model: Qwen3-Coder-Next-4bit (48 MoE layers, 512 experts/layer, top-10 ro
 ## Two-Repo Setup
 
 - **`PATH_REMOVED (this repo) — Benchmarks, analysis, `generate_lazy.py`. Uses uv, Python 3.13.
-- **`PATH_REMOVED (local fork, `lazy-experts` branch) — Core implementation in `mlx_lm/lazy_experts.py`. Has its own `.venv`.
+- **`PATH_REMOVED (local fork, `lazy-experts` branch) — Core implementation in `mlx_lm/lazy_experts/` sub-package. Has its own `.venv`.
 
 ## Commands
 
@@ -23,8 +23,15 @@ PATH_REMOVED generate_lazy.py ["prompt"] [max_tokens] [capacity] [mode] [refresh
 # Cache-persistent generation (skips 75s warmup on repeat runs)
 PATH_REMOVED generate_persistent.py <cache.json> ["prompt"] [max_tokens] [capacity]
 
-# Universal expert profiling (22 prompts, ~33 min)
-PATH_REMOVED benchmarks/profile_experts.py [capacity] [threshold] [output.json]
+# Universal expert profiling (22 prompts, ~33 min per model)
+PATH_REMOVED benchmarks/profile_experts.py --model qwen   # or mixtral, glm, or HF name
+PATH_REMOVED benchmarks/profile_experts.py --model mixtral --output mixtral_experts.json
+
+# Streaming generation
+PATH_REMOVED generate_streaming.py --model qwen --prompt "Write a Flask server" --tokens 200
+
+# Multi-turn session benchmark (memory growth + quality over N turns)
+PATH_REMOVED benchmarks/bench_multiturn.py --model qwen --turns 20 --tokens 200
 
 # Pinning benchmark (4 configs × 1000 tokens)
 PATH_REMOVED benchmarks/bench_pinning.py [profile.json] [capacity] [max_tokens]

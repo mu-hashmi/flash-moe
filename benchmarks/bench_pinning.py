@@ -7,6 +7,7 @@ Usage:
     PATH_REMOVED bench_pinning.py [profile_path] [capacity] [max_tokens]
 """
 
+import argparse
 import sys
 import time
 import mlx.core as mx
@@ -18,7 +19,11 @@ from mlx_lm.lazy_experts import (
     dynamic_cache_update, measure_fallback,
 )
 
-MODEL = "mlx-community/Qwen3-Coder-Next-4bit"
+MODEL_PRESETS = {
+    "qwen": ("mlx-community/Qwen3-Coder-Next-4bit", 208),
+    "mixtral": ("mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit", 6),
+    "glm": ("mlx-community/GLM-4.7-Flash-4bit", 48),
+}
 WARMUP_TOKENS = 10
 PROMPT = "Write a comprehensive tutorial on building a web application with Python and Flask, including project setup, routing, templates, database integration, authentication, and deployment"
 
@@ -78,23 +83,62 @@ def run_generation(model, tokenizer, max_tokens, refresh_interval=0):
     }
 
 
-def main():
-    profile_path = sys.argv[1] if len(sys.argv) > 1 else "universal_experts.json"
-    capacity = int(sys.argv[2]) if len(sys.argv) > 2 else 208
-    max_tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
+def apply_chat_template(tokenizer, text):
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                add_generation_prompt=True, tokenize=False)
+        except Exception:
+            pass
+    return text
 
-    model_path = hf_repo_to_path(MODEL)
+
+def load_and_setup(model_name, model_path, capacity, tokenizer_wrap=None):
+    """Load model, enable lazy experts, warmup, return (model, tokenizer)."""
+    model, tokenizer = mlx_lm.load(model_name, lazy=True)
+    enable_lazy_experts(model, model_path, cache_capacity_per_layer=capacity, predictive=True)
+    mx.eval(model.parameters())
+    print(f"Params loaded: {mx.get_active_memory() / 1e9:.1f} GB")
+
+    prompt = PROMPT
+    if tokenizer_wrap:
+        prompt = apply_chat_template(tokenizer, PROMPT)
+    mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=WARMUP_TOKENS, verbose=False)
+    return model, tokenizer
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Pinning benchmark")
+    parser.add_argument("--model", "-m", default="qwen",
+                        help="Model preset (qwen/mixtral/glm) or HuggingFace name")
+    parser.add_argument("--profile", default=None,
+                        help="Profile JSON path (default: auto per model)")
+    parser.add_argument("--capacity", "-c", type=int, default=None)
+    parser.add_argument("--max-tokens", "-t", type=int, default=1000)
+    args = parser.parse_args()
+
+    if args.model in MODEL_PRESETS:
+        model_name, default_capacity = MODEL_PRESETS[args.model]
+    else:
+        model_name = args.model
+        default_capacity = 208
+
+    capacity = args.capacity or default_capacity
+    max_tokens = args.max_tokens
+    use_chat = args.model in ("mixtral", "glm") or "instruct" in model_name.lower()
+    profile_path = args.profile or f"{args.model}_experts.json"
+
+    model_path = hf_repo_to_path(model_name)
+    print(f"Model: {model_name}")
+    print(f"Capacity: {capacity}, Max tokens: {max_tokens}")
+    print(f"Profile: {profile_path}")
 
     # --- Config A: Baseline (no pinning, no refresh) ---
     print("=" * 60)
     print("CONFIG A: Baseline (no pinning, no refresh)")
     print("=" * 60)
-    model, tokenizer = mlx_lm.load(MODEL, lazy=True)
-    enable_lazy_experts(model, model_path, cache_capacity_per_layer=capacity, predictive=True)
-    mx.eval(model.parameters())
-    print(f"Params loaded: {mx.get_active_memory() / 1e9:.1f} GB")
-
-    mlx_lm.generate(model, tokenizer, prompt=PROMPT, max_tokens=WARMUP_TOKENS, verbose=False)
+    model, tokenizer = load_and_setup(model_name, model_path, capacity, use_chat)
     upgrade_to_predictive(model, model_path, capacity)
     print(f"Upgraded: {mx.get_active_memory() / 1e9:.1f} GB")
 
@@ -104,16 +148,13 @@ def main():
         print(f"  Token {cp['token']:4d}: {cp['tok_s']:.1f} tok/s, rep={cp['repetition']:.2f}, "
               f"{cp['tail_sample'][:60]}")
     del model
+    mx.clear_cache()
 
     # --- Config B: Baseline + refresh every 50 tokens ---
     print("\n" + "=" * 60)
     print("CONFIG B: Baseline + refresh every 50 tokens")
     print("=" * 60)
-    model, tokenizer = mlx_lm.load(MODEL, lazy=True)
-    enable_lazy_experts(model, model_path, cache_capacity_per_layer=capacity, predictive=True)
-    mx.eval(model.parameters())
-
-    mlx_lm.generate(model, tokenizer, prompt=PROMPT, max_tokens=WARMUP_TOKENS, verbose=False)
+    model, tokenizer = load_and_setup(model_name, model_path, capacity, use_chat)
     upgrade_to_predictive(model, model_path, capacity)
     print(f"Upgraded: {mx.get_active_memory() / 1e9:.1f} GB")
 
@@ -124,6 +165,7 @@ def main():
         print(f"  Token {cp['token']:4d}: {cp['tok_s']:.1f} tok/s, rep={cp['repetition']:.2f}, "
               f"{cp['tail_sample'][:60]}")
     del model
+    mx.clear_cache()
 
     # --- Config C: Pinning (no refresh) ---
     print("\n" + "=" * 60)
@@ -133,11 +175,7 @@ def main():
     n_universal = sum(len(v["universal"]) for v in profile["layers"].values())
     print(f"Loaded profile: {n_universal} total universal experts across {len(profile['layers'])} layers")
 
-    model, tokenizer = mlx_lm.load(MODEL, lazy=True)
-    enable_lazy_experts(model, model_path, cache_capacity_per_layer=capacity, predictive=True)
-    mx.eval(model.parameters())
-
-    mlx_lm.generate(model, tokenizer, prompt=PROMPT, max_tokens=WARMUP_TOKENS, verbose=False)
+    model, tokenizer = load_and_setup(model_name, model_path, capacity, use_chat)
     upgrade_to_predictive_with_pinning(model, model_path, capacity, profile, pin_threshold=0.5)
     print(f"Upgraded with pinning: {mx.get_active_memory() / 1e9:.1f} GB")
 
@@ -147,16 +185,13 @@ def main():
         print(f"  Token {cp['token']:4d}: {cp['tok_s']:.1f} tok/s, rep={cp['repetition']:.2f}, "
               f"{cp['tail_sample'][:60]}")
     del model
+    mx.clear_cache()
 
     # --- Config D: Pinning + refresh every 50 tokens ---
     print("\n" + "=" * 60)
     print("CONFIG D: Pinning + refresh every 50 tokens")
     print("=" * 60)
-    model, tokenizer = mlx_lm.load(MODEL, lazy=True)
-    enable_lazy_experts(model, model_path, cache_capacity_per_layer=capacity, predictive=True)
-    mx.eval(model.parameters())
-
-    mlx_lm.generate(model, tokenizer, prompt=PROMPT, max_tokens=WARMUP_TOKENS, verbose=False)
+    model, tokenizer = load_and_setup(model_name, model_path, capacity, use_chat)
     upgrade_to_predictive_with_pinning(model, model_path, capacity, profile, pin_threshold=0.5)
     print(f"Upgraded with pinning: {mx.get_active_memory() / 1e9:.1f} GB")
 
@@ -171,6 +206,7 @@ def main():
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
+    print(f"Model: {model_name}, Capacity: {capacity}")
     print(f"{'Config':<30} {'tok/s':>6} {'Swaps':>6} {'Rep@300':>8} {'Rep@500':>8} {'Rep@1000':>8}")
     for label, result in [("A: Baseline", result_a), ("B: +Refresh", result_b),
                           ("C: +Pinning", result_c), ("D: +Pinning+Refresh", result_d)]:
