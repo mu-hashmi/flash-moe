@@ -10,8 +10,13 @@ def main():
     serve.add_argument("model", help="HuggingFace model name (e.g. mlx-community/Qwen3-Coder-Next-4bit)")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--capacity", type=int, default=None)
+    serve.add_argument("--capacity", type=int, default=None,
+                       help="Experts cached per MoE layer (auto-selected if omitted)")
     serve.add_argument("--profile", default=None, help="Path to expert profile JSON")
+    serve.add_argument("--max-tokens", type=int, default=4096,
+                       help="Max output tokens per request (default: 4096)")
+    serve.add_argument("--max-input-tokens", type=int, default=16384,
+                       help="Max input tokens — rejects requests over this (default: 16384)")
 
     args = parser.parse_args()
 
@@ -23,6 +28,8 @@ def main():
             port=args.port,
             capacity=args.capacity,
             profile_path=args.profile,
+            max_tokens=args.max_tokens,
+            max_input_tokens=args.max_input_tokens,
         )
     else:
         parser.print_help()
