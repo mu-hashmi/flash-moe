@@ -156,6 +156,24 @@ def _convert_tools_anthropic_to_openai(tools: list) -> list:
     } for t in tools]
 
 
+def _sampling_kwargs(body: dict) -> dict:
+    """Extract sampling params from request body.
+
+    Defaults (temp=0, greedy) come from mlx-lm's make_sampler.
+    Clients should send their own values; model-specific recommendations
+    (e.g. Qwen3-Coder: temp=1.0, top_p=0.95, top_k=40) belong in the
+    client config, not the server.
+    """
+    kwargs = {}
+    if "temperature" in body:
+        kwargs["temp"] = float(body["temperature"])
+    if "top_p" in body:
+        kwargs["top_p"] = float(body["top_p"])
+    if "top_k" in body:
+        kwargs["top_k"] = int(body["top_k"])
+    return kwargs
+
+
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 
@@ -193,12 +211,12 @@ class Server:
         self._tokenizer = session._tokenizer
         self._memory_gb = session.memory_gb
 
-    def _stream(self, prompt: str, max_tokens: int):
+    def _stream(self, prompt: str, max_tokens: int, **sampling):
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
         yield from _mlx_lm.stream_generate(
             self._model, self._tokenizer, prompt=prompt, max_tokens=max_tokens,
-            sampler=make_sampler(temp=1.0, top_p=0.95, top_k=40),
+            sampler=make_sampler(**sampling),
         )
 
     def _tokenize_messages(self, messages: list, tools: list | None = None) -> str:
@@ -229,9 +247,13 @@ class Server:
     async def handle_chat_completions(self, request: Request):
         body = await request.json()
         messages = body["messages"]
-        max_tokens = min(body.get("max_tokens") or body.get("max_completion_tokens", 2048), MAX_TOKENS_CAP)
+        raw = body.get("max_tokens")
+        if raw is None:
+            raw = body.get("max_completion_tokens")
+        max_tokens = min(raw if raw is not None else MAX_TOKENS_CAP, MAX_TOKENS_CAP)
         stream = body.get("stream", False)
         tools = body.get("tools")
+        sampling = _sampling_kwargs(body)
 
         formatted = _format_messages(messages)
         prompt = self._tokenize_messages(formatted, tools=tools)
@@ -240,16 +262,16 @@ class Server:
         if input_tokens > MAX_INPUT_TOKENS:
             return JSONResponse({"error": {"message": f"Prompt too long: {input_tokens} tokens exceeds {MAX_INPUT_TOKENS} limit", "type": "invalid_request_error"}}, status_code=400)
 
-        print(f"  [openai] max_tokens={max_tokens} input_tokens={input_tokens}")
+        print(f"  [openai] max_tokens={max_tokens} stream={stream} input_tokens={input_tokens}")
 
         if stream:
             return StreamingResponse(
-                self._stream_openai(prompt, max_tokens, tools),
+                self._stream_openai(prompt, max_tokens, tools, **sampling),
                 media_type="text/event-stream",
             )
 
         async with self._lock:
-            text, gen_tokens, tps = self._generate_sync(prompt, max_tokens)
+            text, gen_tokens, tps = self._generate_sync(prompt, max_tokens, **sampling)
 
         return JSONResponse({
             "id": _make_chatcmpl_id(),
@@ -277,8 +299,9 @@ class Server:
             )
         if system:
             system = _truncate_system(system)
-        max_tokens = min(body.get("max_tokens", 2048), MAX_TOKENS_CAP)
+        max_tokens = min(body.get("max_tokens", MAX_TOKENS_CAP), MAX_TOKENS_CAP)
         stream = body.get("stream", False)
+        sampling = _sampling_kwargs(body)
 
         tools_anthropic = body.get("tools")
         if tools_anthropic:
@@ -323,12 +346,12 @@ class Server:
 
         if stream:
             return StreamingResponse(
-                self._stream_anthropic(prompt, max_tokens, tools_openai, input_tokens),
+                self._stream_anthropic(prompt, max_tokens, tools_openai, input_tokens, **sampling),
                 media_type="text/event-stream",
             )
 
         async with self._lock:
-            text, gen_tokens, tps = self._generate_sync(prompt, max_tokens)
+            text, gen_tokens, tps = self._generate_sync(prompt, max_tokens, **sampling)
 
         return JSONResponse({
             "id": _make_msg_id(),
@@ -343,11 +366,11 @@ class Server:
             },
         })
 
-    def _generate_sync(self, prompt: str, max_tokens: int) -> tuple[str, int, float]:
+    def _generate_sync(self, prompt: str, max_tokens: int, **sampling) -> tuple[str, int, float]:
         text = ""
         gen_tokens = 0
         tps = 0.0
-        for resp in self._stream(prompt, max_tokens=max_tokens):
+        for resp in self._stream(prompt, max_tokens=max_tokens, **sampling):
             text += resp.text
             gen_tokens = resp.generation_tokens
             tps = resp.generation_tps
@@ -357,7 +380,7 @@ class Server:
         return text, gen_tokens, tps
 
     async def _stream_openai(self, prompt: str, max_tokens: int,
-                             tools: list | None):
+                             tools: list | None, **sampling):
         chat_id = _make_chatcmpl_id()
         created = int(time.time())
 
@@ -381,7 +404,7 @@ class Server:
 
         try:
             async with self._lock:
-                for resp in self._stream(prompt, max_tokens=max_tokens):
+                for resp in self._stream(prompt, max_tokens=max_tokens, **sampling):
                     gen_tokens = resp.generation_tokens
                     tps = resp.generation_tps
 
@@ -453,7 +476,7 @@ class Server:
             print(f"  [client disconnected after {gen_tokens} tokens]")
 
     async def _stream_anthropic(self, prompt: str, max_tokens: int,
-                                tools: list | None, input_tokens: int):
+                                tools: list | None, input_tokens: int, **sampling):
         msg_id = _make_msg_id()
 
         event = {
@@ -480,7 +503,7 @@ class Server:
 
         try:
             async with self._lock:
-                for resp in self._stream(prompt, max_tokens=max_tokens):
+                for resp in self._stream(prompt, max_tokens=max_tokens, **sampling):
                     gen_tokens = resp.generation_tokens
                     tps = resp.generation_tps
 
