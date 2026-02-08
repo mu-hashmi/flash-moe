@@ -127,7 +127,12 @@ def main():
     capacity = args.capacity or default_capacity
     max_tokens = args.max_tokens
     use_chat = args.model in ("mixtral", "glm") or "instruct" in model_name.lower()
-    profile_path = args.profile or f"{args.model}_experts.json"
+    profile_defaults = {
+        "qwen": "profiles/qwen3-coder-next.json",
+        "mixtral": "profiles/mixtral-8x7b.json",
+        "glm": "profiles/glm-4.7-flash.json",
+    }
+    profile_path = args.profile or profile_defaults.get(args.model, f"{args.model}_experts.json")
 
     model_path = hf_repo_to_path(model_name)
     print(f"Model: {model_name}")
