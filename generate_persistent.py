@@ -24,7 +24,7 @@ import time
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from mlx_lm.lazy_experts import (
+from flash_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, save_cache_state,
     load_cache_state, upgrade_from_saved_state, get_fallback_stats,
     fast_delta_warmup, get_cache_stats,

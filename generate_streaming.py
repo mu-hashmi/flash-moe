@@ -10,7 +10,7 @@ import argparse
 import time
 
 import mlx.core as mx
-from mlx_lm.lazy_experts import flash_stream_generate
+from flash_moe.lazy_experts import flash_stream_generate
 
 MODEL_PRESETS = {
     "qwen": "mlx-community/Qwen3-Coder-Next-4bit",

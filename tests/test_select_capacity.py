@@ -1,7 +1,7 @@
 import sys
 sys.path.insert(0, "/Users/muhash/mlx-lm")
 
-from mlx_lm.lazy_experts import select_capacity
+from flash_moe.lazy_experts import select_capacity
 
 NON_EXPERT_GB = 1.4
 
