@@ -15,6 +15,36 @@ from .modules import (
 )
 
 
+def _run_gate(moe_block, x) -> mx.array:
+    """Run the MoE block's gate and return top-k expert indices.
+
+    Handles two gate styles:
+      - Standard (Qwen, Mixtral): gate returns raw logits, we softmax + argpartition
+      - GLM-style: gate returns (inds, scores) tuple directly
+    """
+    result = moe_block.gate(x)
+    if isinstance(result, tuple):
+        inds, _ = result
+        return inds
+
+    gates = result
+    k = getattr(moe_block, "top_k", None) or getattr(moe_block, "num_experts_per_tok", 2)
+    gates = mx.softmax(gates, axis=-1, precise=True)
+    return mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+
+
+def _shared_expert_output(moe_block, x) -> mx.array:
+    """Compute the shared expert contribution, or zeros if none."""
+    if hasattr(moe_block, "shared_expert") and hasattr(moe_block, "shared_expert_gate"):
+        se = moe_block.shared_expert(x)
+        return mx.sigmoid(moe_block.shared_expert_gate(x)) * se
+    if hasattr(moe_block, "shared_expert"):
+        return moe_block.shared_expert(x)
+    if hasattr(moe_block, "shared_experts"):
+        return moe_block.shared_experts(x)
+    return mx.zeros_like(x)
+
+
 def router_only_forward(model, tokenizer, prompt: str,
                         max_tokens: int = 10) -> dict[int, set[int]]:
     """Run the model with MoE expert computation skipped, collecting router selections.
@@ -61,22 +91,11 @@ def router_only_forward(model, tokenizer, prompt: str,
             if layer_idx is None:
                 return orig_call(self, x)
 
-            gates = self.gate(x)
-            gates = mx.softmax(gates, axis=-1, precise=True)
-            k = getattr(self, "top_k", None) or self.num_experts_per_tok
-            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            inds = _run_gate(self, x)
             mx.eval(inds)
             flat = np.asarray(inds.reshape(-1))
             collected[layer_idx].update(int(e) for e in flat)
-
-            if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):
-                shared_y = self.shared_expert(x)
-                shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-                return shared_y
-            elif hasattr(self, "shared_expert"):
-                return self.shared_expert(x)
-            else:
-                return mx.zeros_like(x)
+            return _shared_expert_output(self, x)
         return _skip
 
     for block_type, blocks in type_to_blocks.items():
@@ -138,20 +157,9 @@ def router_only_discovery(model, tokenizer, prompt: str,
             if layer_idx is None:
                 return orig_call(self, x)
 
-            gates = self.gate(x)
-            gates = mx.softmax(gates, axis=-1, precise=True)
-            k = getattr(self, "top_k", None) or self.num_experts_per_tok
-            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            inds = _run_gate(self, x)
             collected[layer_idx].append(inds)
-
-            if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):
-                shared_y = self.shared_expert(x)
-                shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-                return shared_y
-            elif hasattr(self, "shared_expert"):
-                return self.shared_expert(x)
-            else:
-                return mx.zeros_like(x)
+            return _shared_expert_output(self, x)
         return _skip
 
     for block_type, blocks in type_to_blocks.items():
@@ -249,20 +257,7 @@ def speculative_router_probe(model, tokenizer, prompt: str,
 
             mx.eval(x)
             hidden_states_per_layer[layer_idx].append(x)
-
-            gates = self.gate(x)
-            gates = mx.softmax(gates, axis=-1, precise=True)
-            k = getattr(self, "top_k", None) or self.num_experts_per_tok
-            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-
-            if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):
-                shared_y = self.shared_expert(x)
-                shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-                return shared_y
-            elif hasattr(self, "shared_expert"):
-                return self.shared_expert(x)
-            else:
-                return mx.zeros_like(x)
+            return _shared_expert_output(self, x)
         return _skip
 
     for block_type, blocks in type_to_blocks.items():
@@ -287,10 +282,7 @@ def speculative_router_probe(model, tokenizer, prompt: str,
         moe_block = _find_moe_block(model.layers[layer_idx])
         all_experts = set()
         for h in all_states:
-            gates = moe_block.gate(h)
-            gates = mx.softmax(gates, axis=-1, precise=True)
-            k = moe_block.top_k
-            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            inds = _run_gate(moe_block, h)
             mx.eval(inds)
             flat = np.asarray(inds.reshape(-1))
             all_experts.update(int(e) for e in flat)
@@ -346,15 +338,7 @@ def speculative_router_cross_layer(model, tokenizer, prompt: str,
             if layer_idx == first_idx:
                 mx.eval(x)
                 captured_states.append(x)
-
-            if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):
-                shared_y = self.shared_expert(x)
-                shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-                return shared_y
-            elif hasattr(self, "shared_expert"):
-                return self.shared_expert(x)
-            else:
-                return mx.zeros_like(x)
+            return _shared_expert_output(self, x)
         return _skip
 
     for block_type, blocks in type_to_blocks.items():
@@ -375,10 +359,7 @@ def speculative_router_cross_layer(model, tokenizer, prompt: str,
         moe_block = _find_moe_block(model.layers[layer_idx])
         all_experts = set()
         for h in captured_states:
-            gates = moe_block.gate(h)
-            gates = mx.softmax(gates, axis=-1, precise=True)
-            k = moe_block.top_k
-            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            inds = _run_gate(moe_block, h)
             mx.eval(inds)
             flat = np.asarray(inds.reshape(-1))
             all_experts.update(int(e) for e in flat)

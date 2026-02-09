@@ -34,6 +34,8 @@ MODEL_PRESETS = {
     "mixtral": ("mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit", 6),
     "mixtral-8x22b": ("mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit", 2),
     "glm": ("mlx-community/GLM-4.7-Flash-4bit", 48),
+    "qwen2-moe": ("mlx-community/Qwen2-57B-A14B-Instruct-4bit", 32),
+    "qwen3-30b": ("mlx-community/Qwen3-30B-A3B-4bit", 128),
 }
 
 WARMUP_TOKENS = 10
@@ -139,7 +141,7 @@ def main():
 
     capacity = args.capacity if args.capacity is not None else default_capacity
     output_path = args.output or f"{short_name}_experts.json"
-    use_chat_template = args.model in ("mixtral", "glm") or "instruct" in model_name.lower()
+    use_chat_template = args.model in ("mixtral", "glm", "qwen2-moe", "qwen3-30b") or "instruct" in model_name.lower()
 
     model_path = hf_repo_to_path(model_name)
     print(f"Model: {model_name}")

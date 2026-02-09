@@ -73,13 +73,33 @@ Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from th
 
 ## Supported Models
 
-| Model | Experts | Top-K | MoE Layers | Memory | tok/s |
-|-------|--------:|------:|-----------:|-------:|------:|
-| [Qwen3-Coder-Next-4bit](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit) | 512 | 10 | 48 | 19.1 GB | 8-23 |
-| [Mixtral-8x7B-Instruct-v0.1-4bit](https://huggingface.co/mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit) | 8 | 2 | 32 | 19.9 GB | 4.5 |
-| [GLM-4.7-Flash-4bit](https://huggingface.co/mlx-community/GLM-4.7-Flash-4bit) | 64 | 4 | 46 | 13.0 GB | 5.7 |
+| Model | Experts | Top-K | MoE Layers | Memory | tok/s | Fallback |
+|-------|--------:|------:|-----------:|-------:|------:|---------:|
+| [Qwen3-Coder-Next-4bit](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit) | 512 | 10 | 48 | 19.1 GB | 23 | 0% |
+| [GLM-4.7-Flash-4bit](https://huggingface.co/mlx-community/GLM-4.7-Flash-4bit) | 64 | 4 | 46 | 16.9 GB | 47 | 0% |
+| [Qwen3-30B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3-30B-A3B-4bit) | 128 | 8 | 48 | 17.2 GB | 61 | 0% |
+| [Qwen2-MoE-57B-A14B-4bit](https://huggingface.co/mlx-community/Qwen2-57B-A14B-Instruct-4bit) | 64 | 8 | 28 | 18.4 GB | 16 | 46% |
+| [Mixtral-8x7B-Instruct-v0.1-4bit](https://huggingface.co/mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit) | 8 | 2 | 32 | 19.9 GB | 4.5 | ~25% |
 
-Any MLX model using `SwitchGLU` is supported — covers Qwen, Mixtral, GLM, DeepSeek, Hunyuan, PhiMoE, Jamba, OLMoE, MiniMax, and GraniteMoE families. Both stacked and per-expert safetensors formats are handled automatically.
+Any MLX model using `SwitchGLU` is supported — covers Qwen, Mixtral, GLM, DeepSeek, Hunyuan, PhiMoE, Jamba, OLMoE, MiniMax, and GraniteMoE families. Both stacked and per-expert safetensors formats are handled automatically. Models with complex gates (e.g. GLM's `MoEGate` that returns `(inds, scores)` tuples) are also supported.
+
+### Which Models Benefit Most?
+
+flash-moe works best when three conditions hold:
+
+1. **High expert ratio** (expert_count / top_k ≥ 10) — more experts relative to active slots means more can be lazy-loaded
+2. **Shared expert** — provides a quality floor when routed experts miss, enabling graceful degradation instead of garbage output
+3. **Concentrated routing** — a small set of "universal" experts handles most tokens; the long tail of rare experts can stay on SSD
+
+| Model | Ratio | Shared Expert | Routing | Flash-MoE Benefit |
+|-------|------:|:---:|:---:|:---:|
+| Qwen3-Coder-Next (512 exp) | 51x | Yes | 15% universal | **Excellent** |
+| GLM-4.7-Flash (64 exp) | 16x | Yes | 44% universal | **Good** |
+| Qwen3-30B-A3B (128 exp) | 16x | No | 14% universal | Limited — needs ~75% coverage |
+| Qwen2-MoE-57B (64 exp) | 8x | Yes | 95% universal | Limited — all experts needed |
+| Mixtral-8x7B (8 exp) | 4x | No | 100% universal | Poor — ratio too low |
+
+Models without a shared expert collapse to garbage below ~75% expert coverage. Models with uniform routing (all experts equally important) can't benefit from selective caching. The sweet spot is high ratio + shared expert + concentrated routing — exactly what Qwen3-Coder-Next and the upcoming Qwen3-Coder-480B have.
 
 ## Hardware Requirements
 
