@@ -77,6 +77,9 @@ def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
                                    num_moe_layers=num_moe_layers,
                                    expert_slot_mb=expert_slot_mb)
 
+    if num_experts > 0:
+        capacity = min(capacity, num_experts)
+
     # Always use predictive mode (zero-eval forward pass). Even at cap < num_experts,
     # predictive mode avoids the mx.eval() calls inside the forward pass that break
     # async_eval pipelining and cause OOM with large experts (~170 MB for Mixtral 22B).

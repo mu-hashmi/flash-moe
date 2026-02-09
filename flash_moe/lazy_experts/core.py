@@ -817,37 +817,49 @@ def enable_skip_fallback(model) -> int:
 
 
 def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
-    """Replace a MoE block's __call__ with one that masks missing expert scores."""
-    original_call = moe_block.__call__.__func__ if hasattr(moe_block.__call__, '__func__') else None
+    """Replace a MoE block's __call__ with one that masks missing expert scores.
+
+    Handles two gate styles:
+      - Standard (Qwen, Mixtral): gate returns raw logits
+      - GLM-style: gate returns (inds, scores) tuple directly
+    """
+    gate_returns_tuple = _gate_returns_tuple(moe_block)
 
     def patched_call(self, x):
-        gates = self.gate(x)
+        if gate_returns_tuple:
+            inds, scores = self.gate(x)
+        else:
+            gates = self.gate(x)
+            k = getattr(self, "num_experts_per_tok", getattr(self, "top_k", 2))
+            inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            scores = mx.softmax(scores, axis=-1, precise=True)
 
-        k = getattr(self, "num_experts_per_tok", getattr(self, "top_k", 2))
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        scores = mx.softmax(scores, axis=-1, precise=True)
-
-        # Zero scores for missing experts, renormalize hits
         mask = cache.hit_mask[inds]
         scores = scores * mask
         score_sum = scores.sum(axis=-1, keepdims=True)
-        # When all experts miss, score_sum=0 → keep zeros (residual passthrough)
         scores = mx.where(score_sum > 0, scores / score_sum, scores)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
-        # shared_expert contribution (Qwen-style models)
         if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):
             se = self.shared_expert(x)
-            se_gate = mx.sigmoid(self.shared_expert_gate(x))
-            y = y + se * se_gate
+            y = y + mx.sigmoid(self.shared_expert_gate(x)) * se
+        elif hasattr(self, "shared_experts"):
+            y = y + self.shared_experts(x)
 
         return y
 
     import types
     moe_block.__call__ = types.MethodType(patched_call, moe_block)
+
+
+def _gate_returns_tuple(moe_block) -> bool:
+    """Check if the gate returns (inds, scores) tuple vs raw logits."""
+    gate = moe_block.gate
+    # GLM's MoEGate returns a tuple; standard nn.Linear returns an array
+    return not isinstance(gate, nn.Linear)
 
 
 def get_fallback_stats(model) -> dict:
