@@ -2,6 +2,8 @@
 
 import contextlib
 import json
+import mmap
+import struct
 from pathlib import Path
 
 import mlx.core as mx
@@ -118,9 +120,27 @@ def _load_proj_experts(shard: dict, key_prefix: str, expert_ids,
     stacked_key = f"{key_prefix}.weight"
     if stacked_key in shard:
         w = shard[stacked_key][expert_ids]
-        s = shard[f"{key_prefix}.scales"][expert_ids]
+
+        scales_key = f"{key_prefix}.scales"
+        if scales_key in shard:
+            s = shard[scales_key][expert_ids]
+        elif shard_map:
+            alt = mx.load(shard_map[scales_key])
+            s = alt[scales_key][expert_ids]
+            del alt
+        else:
+            raise KeyError(scales_key)
+
         biases_key = f"{key_prefix}.biases"
-        b = shard[biases_key][expert_ids] if biases_key in shard else None
+        if biases_key in shard:
+            b = shard[biases_key][expert_ids]
+        elif shard_map and biases_key in shard_map:
+            alt = mx.load(shard_map[biases_key])
+            b = alt[biases_key][expert_ids]
+            del alt
+        else:
+            b = None
+
         return w, s, b
 
     # Per-expert format: key_prefix is e.g.
@@ -180,6 +200,141 @@ def _load_proj_experts(shard: dict, key_prefix: str, expert_ids,
     return w, s, b
 
 
+_ST_DTYPE_TO_NUMPY = {
+    "F16": (np.float16, mx.float16),
+    "F32": (np.float32, mx.float32),
+    "I8": (np.int8, mx.int8),
+    "I16": (np.int16, mx.int16),
+    "I32": (np.int32, mx.int32),
+    "I64": (np.int64, mx.int64),
+    "U8": (np.uint8, mx.uint8),
+    "U16": (np.uint16, mx.uint16),
+    "U32": (np.uint32, mx.uint32),
+    "U64": (np.uint64, mx.uint64),
+    # numpy has no bfloat16; load as uint16 then view-cast in MLX
+    "BF16": (np.uint16, mx.bfloat16),
+}
+
+
+class SafetensorsMap:
+    """Memory-mapped access to safetensors files.
+
+    Parses headers at init, mmaps each shard file. Supports two access modes:
+    - get_tensor(): load a full tensor via numpy view of mmap'd region
+    - get_expert_slices(): byte-level slicing for stacked (E, ...) tensors,
+      reading only the requested expert rows from disk
+
+    The OS page cache handles caching — no Metal buffer allocation until
+    mx.array() is called.
+    """
+
+    def __init__(self, shard_paths: list[str]):
+        self._mmaps: dict[str, mmap.mmap] = {}
+        self._fds: dict[str, int] = {}
+        # {tensor_key: (shard_path, np_dtype, mx_dtype, shape, byte_offset, byte_length)}
+        self._index: dict[str, tuple] = {}
+
+        for path in shard_paths:
+            if path in self._mmaps:
+                continue
+            fd = open(path, "rb")
+            header_size = struct.unpack("<Q", fd.read(8))[0]
+            header_json = fd.read(header_size)
+            header = json.loads(header_json)
+            data_offset = 8 + header_size
+
+            mm = mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ)
+            self._mmaps[path] = mm
+            self._fds[path] = fd
+
+            for key, meta in header.items():
+                if key == "__metadata__":
+                    continue
+                dtype_str = meta["dtype"]
+                shape = meta["shape"]
+                offsets = meta["data_offsets"]
+                np_dt, mx_dt = _ST_DTYPE_TO_NUMPY[dtype_str]
+                start = data_offset + offsets[0]
+                length = offsets[1] - offsets[0]
+                self._index[key] = (path, np_dt, mx_dt, shape, start, length)
+
+    def get_tensor(self, key: str) -> mx.array:
+        path, np_dt, mx_dt, shape, start, length = self._index[key]
+        mm = self._mmaps[path]
+        buf = mm[start:start + length]
+        arr_np = np.frombuffer(buf, dtype=np_dt).reshape(shape)
+        result = mx.array(arr_np)
+        if mx_dt == mx.bfloat16:
+            result = result.view(mx.bfloat16)
+        return result
+
+    def get_expert_slices(self, key: str, expert_ids) -> mx.array:
+        """Load specific expert rows from a stacked (E, ...) tensor.
+
+        Computes byte offsets for each expert's contiguous row and reads
+        only those bytes from the mmap, avoiding materializing the full tensor.
+        """
+        path, np_dt, mx_dt, shape, start, length = self._index[key]
+        mm = self._mmaps[path]
+        ids = np.asarray(expert_ids).reshape(-1)
+        row_bytes = length // shape[0]
+        row_shape = shape[1:]
+
+        parts = []
+        for eid in ids:
+            row_start = start + int(eid) * row_bytes
+            buf = mm[row_start:row_start + row_bytes]
+            parts.append(np.frombuffer(buf, dtype=np_dt).reshape(row_shape))
+
+        stacked = np.stack(parts)
+        result = mx.array(stacked)
+        if mx_dt == mx.bfloat16:
+            result = result.view(mx.bfloat16)
+        return result
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._index
+
+    def close(self):
+        for mm in self._mmaps.values():
+            mm.close()
+        for fd in self._fds.values():
+            fd.close()
+        self._mmaps.clear()
+        self._fds.clear()
+        self._index.clear()
+
+
+def _mmap_load_proj_experts(
+    st_map: SafetensorsMap, key_prefix: str, expert_ids,
+) -> tuple[mx.array, mx.array, mx.array | None]:
+    """Load weight/scales/biases for ``expert_ids`` via mmap with byte-level slicing.
+
+    Drop-in alternative to ``_load_proj_experts`` for stacked-format models.
+    Only reads the bytes for requested experts from disk (via OS page cache),
+    avoiding materialization of the full stacked tensor.
+
+    Only supports stacked format (``{key_prefix}.weight`` is ``(E, ...)``).
+    Per-expert format should still use ``_load_proj_experts`` with ``mx.load``.
+    """
+    ids = np.asarray(expert_ids).reshape(-1)
+    w = st_map.get_expert_slices(f"{key_prefix}.weight", ids)
+    s = st_map.get_expert_slices(f"{key_prefix}.scales", ids)
+    biases_key = f"{key_prefix}.biases"
+    b = st_map.get_expert_slices(biases_key, ids) if biases_key in st_map else None
+    return w, s, b
+
+
+def _load_experts(key_prefix: str, expert_ids, shard=None,
+                   shard_map: dict[str, str] | None = None,
+                   st_map: SafetensorsMap | None = None,
+                   ) -> tuple[mx.array, mx.array, mx.array | None]:
+    """Unified expert loading: mmap path for stacked format, mx.load fallback otherwise."""
+    if st_map is not None and f"{key_prefix}.weight" in st_map:
+        return _mmap_load_proj_experts(st_map, key_prefix, expert_ids)
+    return _load_proj_experts(shard, key_prefix, expert_ids, shard_map=shard_map)
+
+
 def select_capacity(target_model_memory_gb: float, system_memory_gb: float,
                     num_moe_layers: int = 48,
                     expert_slot_mb: float = 1.69) -> int:
@@ -201,8 +356,11 @@ def select_capacity(target_model_memory_gb: float, system_memory_gb: float,
     # system overhead). 0.53 accounts for this to stay at cap 208 on 32 GB.
     budget_gb = system_memory_gb * 0.53 - target_model_memory_gb
     expert_memory_per_slot_gb = num_moe_layers * expert_slot_mb / 1024
+    if expert_memory_per_slot_gb <= 0:
+        return 0
     capacity = int(budget_gb / expert_memory_per_slot_gb)
-    capacity = (capacity // 8) * 8
+    if capacity >= 16:
+        capacity = (capacity // 8) * 8
     return max(0, min(512, capacity))
 
 
