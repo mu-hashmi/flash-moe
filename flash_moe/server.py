@@ -154,6 +154,7 @@ class Server:
             self._model_name,
             cache_dir=str(Path.home() / ".cache" / "flash-moe"),
             profile_path=self._profile_path,
+            capacity=self._capacity,
         )
         session._ensure_loaded("Hello")
         self._model = session._model
@@ -391,6 +392,7 @@ class Server:
                         "choices": [{"index": 0, "delta": {"content": resp.text}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
+                    await asyncio.sleep(0)
 
                     if resp.finish_reason == "length":
                         finish = "length"
@@ -495,6 +497,7 @@ class Server:
                         "delta": {"type": "text_delta", "text": resp.text},
                     }
                     yield f"event: content_block_delta\ndata: {json.dumps(event)}\n\n"
+                    await asyncio.sleep(0)
 
                     if resp.finish_reason == "length":
                         stop_reason = "max_tokens"

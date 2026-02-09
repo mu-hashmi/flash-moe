@@ -13,9 +13,11 @@ from .loading import (
     _detect_num_experts,
     _build_shard_map,
     _load_proj_experts,
+    _load_experts,
     _with_cache_limit_zero,
     compute_adaptive_allocations,
     select_capacity,
+    SafetensorsMap,
 )
 from .modules import (
     ExpertCache,
@@ -24,6 +26,9 @@ from .modules import (
     PredictiveExpertCache,
     PredictiveCachedSwitchLinear,
     SyncPredictiveCachedSwitchLinear,
+    SplitExpertCache,
+    SplitExpertSwitchLinear,
+    SplitSwitchGLU,
 )
 
 
@@ -57,6 +62,13 @@ def enable_lazy_experts(
         return _enable_lazy(model, shard_map)
 
 
+_SWITCH_LINEAR_TYPES = (
+    QuantizedSwitchLinear, LazyQuantizedSwitchLinear, CachedQuantizedSwitchLinear,
+    PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear,
+    SplitExpertSwitchLinear,
+)
+
+
 def _enable_lazy(model, shard_map: dict) -> int:
     replaced = 0
     for i, layer in enumerate(model.layers):
@@ -65,7 +77,7 @@ def _enable_lazy(model, shard_map: dict) -> int:
             continue
         for name in ("gate_proj", "up_proj", "down_proj"):
             orig = getattr(switch, name)
-            if not isinstance(orig, QuantizedSwitchLinear):
+            if not isinstance(orig, _SWITCH_LINEAR_TYPES):
                 continue
             key_prefix = f"{key_base}.{name}"
             shard_path = shard_map[f"{key_prefix}.weight"]
@@ -91,7 +103,7 @@ def _enable_cached(model, shard_map: dict, capacity: int) -> int:
         layer_cache = ExpertCache(capacity)
         for name in ("gate_proj", "up_proj", "down_proj"):
             orig = getattr(switch, name)
-            if not isinstance(orig, QuantizedSwitchLinear):
+            if not isinstance(orig, _SWITCH_LINEAR_TYPES):
                 continue
             key_prefix = f"{key_base}.{name}"
             shard_path = shard_map[f"{key_prefix}.weight"]
@@ -113,6 +125,131 @@ def _enable_cached(model, shard_map: dict, capacity: int) -> int:
 def _enable_predictive(model, shard_map: dict, capacity: int) -> int:
     """Install Phase 2 modules for warmup. Call upgrade_to_predictive() after."""
     return _enable_cached(model, shard_map, capacity)
+
+
+def enable_split_experts(
+    model,
+    model_path: Path,
+    split_t: int,
+    st_map: SafetensorsMap | None = None,
+) -> int:
+    """Replace SwitchGLU modules with split-expert versions for top-only inference.
+
+    Loads the top split_t intermediate dimensions of ALL experts into GPU memory.
+    Each SwitchGLU module is replaced with a SplitSwitchGLU that computes a
+    partial expert output using only the cached top segments. No fallback, no
+    lookup table -- every expert always produces a result.
+
+    Split strategy:
+    - up_proj/gate_proj: row split along dim 1 (first split_t output rows)
+    - down_proj: column split along last dim (first split_t_packed input columns)
+
+    The split is exact: the partial output equals the contribution of the first
+    split_t intermediate dimensions to the full SwitchGLU output.
+
+    Args:
+        model: The loaded MLX model (with lazy=True).
+        model_path: Path to the model directory containing safetensors shards.
+        split_t: Number of intermediate dimensions to keep (must be multiple of
+            group_size, typically 64). E.g. 2048 keeps 12.5% of Mixtral 22B's
+            16384 intermediate dims.
+        st_map: Optional SafetensorsMap for mmap-based loading.
+
+    Returns:
+        Number of SwitchGLU modules replaced.
+    """
+    model_path = Path(model_path)
+    shard_map = _build_shard_map(model_path)
+    if st_map is None:
+        st_map = getattr(model, "_st_map", None)
+
+    # Reduce cache limit during loading to prevent GPU timeout under memory pressure.
+    # Same pattern as fast_delta_warmup — 256 MB cache keeps small buffer for intermediate
+    # reuse while reclaiming most Metal headroom.
+    _default_cache = mx.device_info()["memory_size"] // 4
+    mx.set_cache_limit(256 * 1024 * 1024)
+    mx.clear_cache()
+
+    replaced = 0
+    for i, layer in enumerate(model.layers):
+        switch, key_base = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+
+        orig_proj = getattr(switch, "gate_proj")
+        if not isinstance(orig_proj, _SWITCH_LINEAR_TYPES + (QuantizedSwitchLinear,)):
+            continue
+        group_size = orig_proj.group_size
+        bits = orig_proj.bits
+        mode = orig_proj.mode
+
+        # Detect num_experts from the weight tensor shape in the safetensors file,
+        # not from the module (which may be a LazyQuantizedSwitchLinear with no
+        # num_experts attr after enable_lazy_experts).
+        key_prefix_0 = f"{key_base}.gate_proj"
+        wkey = f"{key_prefix_0}.weight"
+        if st_map is not None and wkey in st_map:
+            num_experts = st_map._index[wkey][3][0]  # shape[0]
+        else:
+            num_experts = _detect_num_experts(switch)
+
+        split_cache = SplitExpertCache(split_t, num_experts, group_size, bits)
+
+        pack_factor = 32 // bits
+        split_t_packed = split_t // pack_factor
+        split_t_scale = split_t // group_size
+
+        # Load one projection at a time, slice, eval, free — bounds transient
+        # memory to ~400 MB (one full stacked projection) instead of ~1.2 GB (all 3).
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            key_prefix = f"{key_base}.{proj_name}"
+
+            if st_map is not None and f"{key_prefix}.weight" in st_map:
+                w_full = st_map.get_tensor(f"{key_prefix}.weight")
+                s_full = st_map.get_tensor(f"{key_prefix}.scales")
+                biases_key = f"{key_prefix}.biases"
+                b_full = st_map.get_tensor(biases_key) if biases_key in st_map else None
+            else:
+                shard_path = shard_map[f"{key_prefix}.weight"]
+                shard = mx.load(shard_path)
+                all_ids = mx.arange(num_experts)
+                w_full, s_full, b_full = _load_experts(
+                    key_prefix, all_ids, shard=shard, shard_map=shard_map)
+                del shard
+
+            # MLX slices share the underlying Metal buffer with the source tensor.
+            # Numpy roundtrip creates independent copies so the full tensor can be freed.
+            if proj_name in ("gate_proj", "up_proj"):
+                mx.eval(w_full, s_full) if b_full is None else mx.eval(w_full, s_full, b_full)
+                w_top = mx.array(np.array(w_full[:, :split_t, :]))
+                s_top = mx.array(np.array(s_full[:, :split_t, :]))
+                b_top = mx.array(np.array(b_full[:, :split_t, :])) if b_full is not None else None
+                store_name = proj_name
+            else:
+                mx.eval(w_full, s_full) if b_full is None else mx.eval(w_full, s_full, b_full)
+                w_top = mx.array(np.array(w_full[:, :, :split_t_packed]))
+                s_top = mx.array(np.array(s_full[:, :, :split_t_scale]))
+                b_top = mx.array(np.array(b_full[:, :, :split_t_scale])) if b_full is not None else None
+                store_name = "down_proj_left"
+
+            del w_full, s_full, b_full
+            mx.eval(w_top, s_top) if b_top is None else mx.eval(w_top, s_top, b_top)
+
+            split_cache.weights[store_name] = w_top
+            split_cache.scales[store_name] = s_top
+            split_cache.biases[store_name] = b_top
+
+        moe_block = _find_moe_block(layer)
+        replacement = SplitSwitchGLU(
+            split_cache, group_size, bits, mode, switch.activation)
+        moe_block.switch_mlp = replacement
+        replaced += 1
+
+        print(f"  Layer {i}: split_t={split_t}, {num_experts} experts "
+              f"({mx.get_active_memory() / 1e9:.1f} GB)")
+
+    mx.set_cache_limit(_default_cache)
+    return replaced
 
 
 def reset_to_cached(model, model_path: Path, capacity: int) -> int:
@@ -169,6 +306,7 @@ def upgrade_to_predictive(
     model_path: Path,
     capacity,
     sync: bool = False,
+    st_map: SafetensorsMap | None = None,
 ) -> int:
     """Harvest Phase 2 LCP caches into zero-eval predictive tensors.
 
@@ -181,6 +319,7 @@ def upgrade_to_predictive(
         model_path: Path to the model directory containing safetensors shards.
         capacity: int for uniform capacity, or list[int] for per-MoE-layer capacities.
         sync: If True, use SyncPredictiveCachedSwitchLinear (adds mx.eval per layer).
+        st_map: Optional SafetensorsMap for mmap-based loading of stacked-format experts.
 
     Returns:
         Number of modules upgraded.
@@ -188,6 +327,8 @@ def upgrade_to_predictive(
     model_path = Path(model_path)
     shard_map = _build_shard_map(model_path)
     per_layer_caps = isinstance(capacity, (list, tuple))
+    if st_map is None:
+        st_map = getattr(model, "_st_map", None)
 
     # Pass 1: harvest LCP caches, determine what needs disk loading
     layer_meta = {}
@@ -271,7 +412,7 @@ def upgrade_to_predictive(
     loaded: dict[int, dict[str, dict[int, tuple]]] = {}
 
     for shard_path, group in shard_groups.items():
-        shard = mx.load(shard_path)
+        shard = None if st_map is not None else mx.load(shard_path)
 
         layers_in_batch = sorted(set(layer_i for layer_i, _, _, _ in group))
         for layer_i in layers_in_batch:
@@ -279,8 +420,9 @@ def upgrade_to_predictive(
             to_eval = []
             for name, key_prefix, slot_eids in layer_entries:
                 load_ids = mx.array([eid for _, eid in slot_eids])
-                w_batch, s_batch, b_batch = _load_proj_experts(shard, key_prefix, load_ids,
-                                                              shard_map=shard_map)
+                w_batch, s_batch, b_batch = _load_experts(key_prefix, load_ids,
+                                                          shard=shard, shard_map=shard_map,
+                                                          st_map=st_map)
                 to_eval.extend([w_batch, s_batch])
                 if b_batch is not None:
                     to_eval.append(b_batch)
@@ -330,6 +472,7 @@ def upgrade_to_predictive(
             pred_cache._shard_paths[name] = shard_map[f"{key_prefix}.weight"]
             pred_cache._key_prefixes[name] = key_prefix
         pred_cache._shard_map = shard_map
+        pred_cache._st_map = st_map
 
         pred_cache.build_lookup(cached_ids)
         mx.eval(pred_cache.lookup)
@@ -364,6 +507,7 @@ def upgrade_to_predictive_with_pinning(
     universal_profile: dict,
     pin_threshold: float = 0.5,
     sync: bool = False,
+    st_map: SafetensorsMap | None = None,
 ) -> int:
     """Like upgrade_to_predictive but pins universal experts.
 
@@ -377,12 +521,15 @@ def upgrade_to_predictive_with_pinning(
         universal_profile: Dict from load_universal_profile() or profile_experts.py.
         pin_threshold: Minimum activation fraction to consider an expert universal.
         sync: If True, use SyncPredictiveCachedSwitchLinear.
+        st_map: Optional SafetensorsMap for mmap-based loading of stacked-format experts.
 
     Returns:
         Number of modules upgraded.
     """
     model_path = Path(model_path)
     shard_map = _build_shard_map(model_path)
+    if st_map is None:
+        st_map = getattr(model, "_st_map", None)
     num_prompts = universal_profile["num_prompts"]
     min_count = int(pin_threshold * num_prompts)
 
@@ -480,15 +627,16 @@ def upgrade_to_predictive_with_pinning(
     loaded: dict[int, dict[str, dict[int, tuple]]] = {}
 
     for shard_path, group in shard_groups.items():
-        shard = mx.load(shard_path)
+        shard = None if st_map is not None else mx.load(shard_path)
         layers_in_batch = sorted(set(layer_i for layer_i, _, _, _ in group))
         for layer_i in layers_in_batch:
             layer_entries = [(n, kp, slots) for li, n, kp, slots in group if li == layer_i]
             to_eval = []
             for name, key_prefix, slot_eids in layer_entries:
                 load_ids = mx.array([eid for _, eid in slot_eids])
-                w_batch, s_batch, b_batch = _load_proj_experts(shard, key_prefix, load_ids,
-                                                              shard_map=shard_map)
+                w_batch, s_batch, b_batch = _load_experts(key_prefix, load_ids,
+                                                          shard=shard, shard_map=shard_map,
+                                                          st_map=st_map)
                 to_eval.extend([w_batch, s_batch])
                 if b_batch is not None:
                     to_eval.append(b_batch)
@@ -537,6 +685,7 @@ def upgrade_to_predictive_with_pinning(
             pred_cache._shard_paths[name] = shard_map[f"{key_prefix}.weight"]
             pred_cache._key_prefixes[name] = key_prefix
         pred_cache._shard_map = shard_map
+        pred_cache._st_map = st_map
 
         pred_cache.build_lookup(cached_ids)
         pred_cache.pinned_set = meta["pinned_set"]
@@ -718,9 +867,10 @@ def dynamic_cache_update_ml(
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             shard_path = cache._shard_paths[proj_name]
             key_prefix = cache._key_prefixes[proj_name]
-            shard = mx.load(shard_path)
-            new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
-                                                      shard_map=cache._shard_map)
+            shard = mx.load(shard_path) if cache._st_map is None else None
+            new_w, new_s, new_b = _load_experts(key_prefix, new_eids,
+                                                 shard=shard, shard_map=cache._shard_map,
+                                                 st_map=cache._st_map)
             del shard
 
             if new_b is None:
@@ -750,17 +900,83 @@ def dynamic_cache_update_ml(
             cache.frequency.pop(old_eid, None)
             cache.last_active.pop(old_eid, None)
 
-        lookup_np = np.zeros(cache.num_experts, dtype=np.int32)
-        for slot, eid in enumerate(cache.cached_ids):
-            lookup_np[eid] = slot
-        cache.lookup = mx.array(lookup_np)
-        mx.eval(cache.lookup)
+        cache.rebuild_lookup()
+        mx.eval(cache.lookup, cache.hit_mask)
 
         swap_budget -= 1
         stats.append({"layer": i, "swaps": len(swaps), "fallbacks": n_fallbacks,
                      "requests": n_requests})
 
     return stats
+
+
+def enable_skip_fallback(model) -> int:
+    """Monkey-patch MoE blocks to zero out scores for missing experts.
+
+    Without this, missing experts fall back to cache slot 0 (wrong expert),
+    injecting wrong-expert outputs weighted by the real router score. This
+    corrupts the hidden state and compounds across layers.
+
+    With skip-fallback, missing experts get score=0 and the remaining hits
+    are renormalized. The MoE layer degrades to using only the cached
+    expert(s), which is a partial but directionally correct signal. The
+    residual connection (output = input + MoE(input)) passes through the
+    unchanged input for the missing expert's contribution.
+
+    Returns:
+        Number of MoE blocks patched.
+    """
+    patched = 0
+    for i, layer in enumerate(model.layers):
+        moe_block = _find_moe_block(layer)
+        if moe_block is None:
+            continue
+        switch = getattr(moe_block, "switch_mlp", None)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, PredictiveCachedSwitchLinear):
+            continue
+
+        cache = proj._cache
+        _patch_moe_block_skip_fallback(moe_block, cache)
+        patched += 1
+
+    return patched
+
+
+def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
+    """Replace a MoE block's __call__ with one that masks missing expert scores."""
+    original_call = moe_block.__call__.__func__ if hasattr(moe_block.__call__, '__func__') else None
+
+    def patched_call(self, x):
+        gates = self.gate(x)
+
+        k = getattr(self, "num_experts_per_tok", getattr(self, "top_k", 2))
+        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = mx.softmax(scores, axis=-1, precise=True)
+
+        # Zero scores for missing experts, renormalize hits
+        mask = cache.hit_mask[inds]
+        scores = scores * mask
+        score_sum = scores.sum(axis=-1, keepdims=True)
+        # When all experts miss, score_sum=0 → keep zeros (residual passthrough)
+        scores = mx.where(score_sum > 0, scores / score_sum, scores)
+
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+
+        # shared_expert contribution (Qwen-style models)
+        if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):
+            se = self.shared_expert(x)
+            se_gate = mx.sigmoid(self.shared_expert_gate(x))
+            y = y + se * se_gate
+
+        return y
+
+    import types
+    moe_block.__call__ = types.MethodType(patched_call, moe_block)
 
 
 def get_fallback_stats(model) -> dict:

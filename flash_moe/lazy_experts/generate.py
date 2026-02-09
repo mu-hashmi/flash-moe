@@ -11,8 +11,10 @@ from .loading import (
     _detect_num_experts,
     select_capacity,
     _with_cache_limit_zero,
+    _build_shard_map,
+    SafetensorsMap,
 )
-from .core import enable_lazy_experts, upgrade_to_predictive
+from .core import enable_lazy_experts
 from .warmup import fast_delta_warmup
 from .discovery import router_only_discovery
 from .persistence import (
@@ -30,11 +32,12 @@ _WARMUP_CACHE = 256 * 1024 * 1024
 
 
 def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
-                   prepacked=True):
+                   prepacked=True, capacity=None):
     """Shared startup for flash_generate and flash_stream_generate.
 
     Returns (model, tokenizer, model_path) with all warmup/upgrade/wiring done.
     """
+    from .core import upgrade_to_predictive
     import mlx_lm as _mlx_lm
     from mlx_lm.utils import hf_repo_to_path
 
@@ -44,39 +47,52 @@ def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
     t0 = time.perf_counter()
     model, tokenizer = _mlx_lm.load(model_name, lazy=True)
 
+    # Detect MoE architecture
     num_moe_layers = 0
-    num_experts = 512
+    num_experts = 0
+    expert_slot_mb = 0.0
     for layer in model.layers:
         switch, _ = _find_switch_mlp(layer)
         if switch is not None:
             num_moe_layers += 1
-            num_experts = _detect_num_experts(switch)
+            if num_experts == 0:
+                num_experts = _detect_num_experts(switch)
+            if expert_slot_mb == 0.0:
+                proj = getattr(switch, "gate_proj", None) or getattr(switch, "up_proj", None)
+                if proj is not None and hasattr(proj, "weight"):
+                    w = proj.weight
+                    expert_bytes = w.nbytes // num_experts
+                    expert_slot_mb = expert_bytes * 3 / 1e6
 
-    device_gb = mx.device_info()["memory_size"] / 1e9
-    capacity = select_capacity(1.4, device_gb, num_moe_layers=num_moe_layers)
+    if capacity is None:
+        device_gb = mx.device_info()["memory_size"] / 1e9
 
+        enable_lazy_experts(model, model_path,
+                            cache_capacity_per_layer=0,
+                            predictive=True)
+        mx.eval(model.parameters())
+        base_gb = mx.get_active_memory() / 1e9
+
+        capacity = select_capacity(base_gb, device_gb,
+                                   num_moe_layers=num_moe_layers,
+                                   expert_slot_mb=expert_slot_mb)
+
+    # Always use predictive mode (zero-eval forward pass). Even at cap < num_experts,
+    # predictive mode avoids the mx.eval() calls inside the forward pass that break
+    # async_eval pipelining and cause OOM with large experts (~170 MB for Mixtral 22B).
+    # Fallbacks map to slot 0; between-token swapping corrects misses progressively.
     enable_lazy_experts(model, model_path,
                         cache_capacity_per_layer=capacity,
                         predictive=True)
     mx.eval(model.parameters())
 
-    # Memory guard
-    active_gb = mx.get_active_memory() / 1e9
-    expert_slot_mb = 1.69
-    projected_gb = active_gb + capacity * num_moe_layers * expert_slot_mb / 1024
-    limit_gb = 0.85 * device_gb
-    if projected_gb > limit_gb:
-        max_cap = int((limit_gb - active_gb) * 1024 / (num_moe_layers * expert_slot_mb))
-        capacity = (max_cap // 8) * 8
-        capacity = max(capacity, 0)
-        print(f"  [memory guard: reducing capacity to {capacity}]")
-        enable_lazy_experts(model, model_path,
-                            cache_capacity_per_layer=capacity,
-                            predictive=True)
-        mx.eval(model.parameters())
+    shard_map = _build_shard_map(model_path)
+    all_shards = sorted(set(shard_map.values()))
+    model._st_map = SafetensorsMap(all_shards)
 
     t_load = time.perf_counter() - t0
-    print(f"  Model load: {t_load:.1f}s ({mx.get_active_memory() / 1e9:.1f} GB)")
+    print(f"  Model load: {t_load:.1f}s ({mx.get_active_memory() / 1e9:.1f} GB) "
+          f"[{num_experts} experts, cap={capacity}]")
 
     cache_path = None
     prepacked_path = None
@@ -160,11 +176,9 @@ def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
 def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
                    cache_dir: str | None = None,
                    profile_path: str | None = None,
-                   prepacked: bool = True) -> str:
+                   prepacked: bool = True,
+                   capacity: int | None = None) -> str:
     """One-call generation with all optimizations.
-
-    Auto-detects RAM, selects capacity, loads cached state if available,
-    applies pinning if profile exists, uses cache_limit(0) during warmup.
 
     Args:
         model_name: HuggingFace model name (e.g. "mlx-community/Qwen3-Coder-Next-4bit").
@@ -173,6 +187,7 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
         cache_dir: Directory for cache state persistence. None disables caching.
         profile_path: Path to universal expert profile JSON for pinning.
         prepacked: Save/load prepacked weight files for fastest warm start.
+        capacity: Experts per layer. None = auto-select based on available RAM.
 
     Returns:
         Generated text string.
@@ -181,7 +196,7 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
 
     model, tokenizer, _ = _flash_startup(
         model_name, prompt, cache_dir=cache_dir,
-        profile_path=profile_path, prepacked=prepacked)
+        profile_path=profile_path, prepacked=prepacked, capacity=capacity)
 
     return _mlx_lm.generate(model, tokenizer, prompt=prompt,
                              max_tokens=max_tokens, verbose=False)
@@ -190,14 +205,12 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
 def flash_stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
                           cache_dir: str | None = None,
                           profile_path: str | None = None,
-                          prepacked: bool = True):
+                          prepacked: bool = True,
+                          capacity: int | None = None):
     """Streaming variant of flash_generate.
 
     Startup is blocking. After startup, yields GenerationResponse objects
     from mlx_lm.stream_generate.
-
-    Args:
-        Same as flash_generate.
 
     Yields:
         mlx_lm.generate.GenerationResponse with token-by-token output.
@@ -206,7 +219,7 @@ def flash_stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
 
     model, tokenizer, _ = _flash_startup(
         model_name, prompt, cache_dir=cache_dir,
-        profile_path=profile_path, prepacked=prepacked)
+        profile_path=profile_path, prepacked=prepacked, capacity=capacity)
 
     yield from _mlx_lm.stream_generate(model, tokenizer, prompt=prompt,
                                         max_tokens=max_tokens)
@@ -228,11 +241,13 @@ class FlashSession:
     """
 
     def __init__(self, model_name: str, cache_dir: str | None = None,
-                 profile_path: str | None = None, prepacked: bool = True):
+                 profile_path: str | None = None, prepacked: bool = True,
+                 capacity: int | None = None):
         self._model_name = model_name
         self._cache_dir = cache_dir
         self._profile_path = profile_path
         self._prepacked = prepacked
+        self._capacity = capacity
         self._model = None
         self._tokenizer = None
         self._model_path = None
@@ -242,7 +257,8 @@ class FlashSession:
         if self._model is None:
             self._model, self._tokenizer, self._model_path = _flash_startup(
                 self._model_name, prompt, cache_dir=self._cache_dir,
-                profile_path=self._profile_path, prepacked=self._prepacked)
+                profile_path=self._profile_path, prepacked=self._prepacked,
+                capacity=self._capacity)
             self._last_prompt = prompt
         elif self._last_prompt != prompt:
             t0 = time.perf_counter()
@@ -274,6 +290,10 @@ class FlashSession:
 
     def close(self):
         """Release model and clear GPU memory."""
+        if self._model is not None:
+            st_map = getattr(self._model, "_st_map", None)
+            if st_map is not None:
+                st_map.close()
         self._model = None
         self._tokenizer = None
         self._model_path = None

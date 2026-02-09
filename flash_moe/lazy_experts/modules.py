@@ -4,7 +4,9 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
-from .loading import _load_proj_experts
+from .loading import _load_proj_experts, _load_experts
+
+from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort, SwiGLU
 
 
 class ExpertCache:
@@ -234,12 +236,13 @@ class PredictiveExpertCache:
     Supports dynamic updates between tokens: captures router indices during
     forward pass, then swaps cold experts for newly-requested ones.
     """
-    __slots__ = ('capacity', 'num_experts', 'lookup',
+    __slots__ = ('capacity', 'num_experts', 'lookup', 'hit_mask',
                  'weights', 'scales', 'biases',
                  'cached_ids', 'cached_set',
                  'frequency', 'last_active', 'step',
                  '_indices_buffer',
                  '_shard_paths', '_key_prefixes', '_shard_map',
+                 '_st_map',
                  'total_requests', 'total_fallbacks',
                  'pinned_set')
 
@@ -250,6 +253,7 @@ class PredictiveExpertCache:
         self.scales: dict[str, mx.array] = {}
         self.biases: dict[str, mx.array | None] = {}
         self.lookup: mx.array | None = None
+        self.hit_mask: mx.array | None = None
         self.cached_ids: list[int] = []
         self.cached_set: set[int] = set()
         self.frequency: dict[int, int] = {}
@@ -259,28 +263,33 @@ class PredictiveExpertCache:
         self._shard_paths: dict[str, str] = {}
         self._key_prefixes: dict[str, str] = {}
         self._shard_map: dict[str, str] | None = None
+        self._st_map = None
         self.total_requests: int = 0
         self.total_fallbacks: int = 0
         self.pinned_set: set[int] = set()
 
     def build_lookup(self, cached_ids: list[int]) -> None:
-        """Build GPU-resident lookup table mapping global expert IDs to cache slots.
+        """Build GPU-resident lookup table and hit mask from cached expert IDs.
 
-        Uncached IDs map to slot 0 (fallback). Must be called after populating
-        the weight tensors.
-
-        Args:
-            cached_ids: Ordered list of expert IDs loaded into cache slots.
+        Uncached IDs map to slot 0 (fallback) in the lookup table and 0.0 in
+        the hit mask. Must be called after populating the weight tensors.
         """
         self.cached_ids = list(cached_ids)
         self.cached_set = set(cached_ids)
         for eid in cached_ids:
             self.frequency.setdefault(eid, 1)
             self.last_active.setdefault(eid, 0)
+        self.rebuild_lookup()
+
+    def rebuild_lookup(self) -> None:
+        """Rebuild lookup table and hit mask from current cached_ids."""
         lookup_np = np.zeros(self.num_experts, dtype=np.int32)
-        for slot, eid in enumerate(cached_ids):
+        hit_np = np.zeros(self.num_experts, dtype=np.float32)
+        for slot, eid in enumerate(self.cached_ids):
             lookup_np[eid] = slot
+            hit_np[eid] = 1.0
         self.lookup = mx.array(lookup_np)
+        self.hit_mask = mx.array(hit_np)
 
     def remap(self, indices: mx.array) -> mx.array:
         """Map global expert IDs to cache slots. Pure mx.array op, no eval."""
@@ -354,9 +363,10 @@ class PredictiveExpertCache:
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             shard_path = self._shard_paths[proj_name]
             key_prefix = self._key_prefixes[proj_name]
-            shard = mx.load(shard_path)
-            new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
-                                                      shard_map=self._shard_map)
+            shard = mx.load(shard_path) if self._st_map is None else None
+            new_w, new_s, new_b = _load_experts(key_prefix, new_eids,
+                                                 shard=shard, shard_map=self._shard_map,
+                                                 st_map=self._st_map)
             del shard
 
             if new_b is None:
@@ -386,11 +396,8 @@ class PredictiveExpertCache:
             self.frequency.pop(old_eid, None)
             self.last_active.pop(old_eid, None)
 
-        lookup_np = np.zeros(self.num_experts, dtype=np.int32)
-        for slot, eid in enumerate(self.cached_ids):
-            lookup_np[eid] = slot
-        self.lookup = mx.array(lookup_np)
-        mx.eval(self.lookup)
+        self.rebuild_lookup()
+        mx.eval(self.lookup, self.hit_mask)
 
         return {"swaps": len(swaps), "fallbacks": n_fallbacks, "requests": n_requests}
 
@@ -470,3 +477,105 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
+
+
+class SplitExpertCache:
+    """Per-layer cache holding top segments of ALL experts.
+
+    Splits expert weights along the intermediate dimension:
+    - up_proj/gate_proj: row split (first split_t output rows)
+    - down_proj: column split (first split_t_packed input columns)
+
+    All experts are always present -- no lookup table or remapping needed.
+    Router indices pass directly to gather_qmm.
+    """
+    __slots__ = ('split_t', 'num_experts', 'group_size', 'bits',
+                 'weights', 'scales', 'biases')
+
+    def __init__(self, split_t: int, num_experts: int, group_size: int, bits: int):
+        self.split_t = split_t
+        self.num_experts = num_experts
+        self.group_size = group_size
+        self.bits = bits
+        self.weights: dict[str, mx.array] = {}
+        self.scales: dict[str, mx.array] = {}
+        self.biases: dict[str, mx.array | None] = {}
+
+
+class SplitExpertSwitchLinear(nn.Module):
+    """Expert projection using pre-split top segments of ALL experts.
+
+    For up_proj/gate_proj: outputs first split_t dims of intermediate.
+    For down_proj_left: uses first split_t columns of input (column split).
+
+    No remapping, no fallback -- every expert always has a result.
+    """
+
+    def __init__(self, group_size: int, bits: int, mode: str,
+                 proj_name: str, cache: SplitExpertCache):
+        super().__init__()
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self._proj_name = proj_name
+        self._cache = cache
+        self.freeze()
+
+    def __call__(self, x, indices, sorted_indices=False):
+        return mx.gather_qmm(
+            x,
+            self._cache.weights[self._proj_name],
+            self._cache.scales[self._proj_name],
+            self._cache.biases[self._proj_name],
+            rhs_indices=indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=sorted_indices,
+        )
+
+
+class SplitSwitchGLU(nn.Module):
+    """SwitchGLU replacement using split experts along intermediate dimension.
+
+    Computes a partial SwitchGLU output using only top segments:
+      act_top = silu(gate_top(x)) * up_top(x)     [first split_t intermediate dims]
+      out = down_left(act_top)                      [column split of down_proj]
+
+    This produces the exact contribution of the first split_t intermediate dimensions
+    to the full expert output.
+    """
+
+    def __init__(self, cache: SplitExpertCache, group_size: int, bits: int,
+                 mode: str, activation=None):
+        super().__init__()
+        self.up_proj = SplitExpertSwitchLinear(
+            group_size, bits, mode, "up_proj", cache)
+        self.gate_proj = SplitExpertSwitchLinear(
+            group_size, bits, mode, "gate_proj", cache)
+        self.down_proj = SplitExpertSwitchLinear(
+            group_size, bits, mode, "down_proj_left", cache)
+        self.activation = activation or SwiGLU()
+
+    def __call__(self, x, indices) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        x = self.down_proj(
+            self.activation(x_up, x_gate),
+            idx,
+            sorted_indices=do_sort,
+        )
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)

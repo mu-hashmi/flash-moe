@@ -6,6 +6,9 @@ from .loading import (
     _detect_num_experts,
     _build_shard_map,
     _load_proj_experts,
+    _load_experts,
+    _mmap_load_proj_experts,
+    SafetensorsMap,
     _PROJ_TO_EXPERT_NAMES,
     select_capacity,
     _with_cache_limit_zero,
@@ -19,10 +22,14 @@ from .modules import (
     PredictiveExpertCache,
     PredictiveCachedSwitchLinear,
     SyncPredictiveCachedSwitchLinear,
+    SplitExpertCache,
+    SplitExpertSwitchLinear,
+    SplitSwitchGLU,
 )
 
 from .core import (
     enable_lazy_experts,
+    enable_split_experts,
     reset_to_cached,
     upgrade_to_predictive,
     upgrade_to_predictive_with_pinning,
