@@ -138,7 +138,8 @@ class Server:
     def __init__(self, model_name: str, capacity: int | None = None,
                  profile_path: str | None = None,
                  max_tokens: int = MAX_TOKENS_CAP,
-                 max_input_tokens: int = MAX_INPUT_TOKENS):
+                 max_input_tokens: int = MAX_INPUT_TOKENS,
+                 kv_bits: int | None = None):
         self._model_name = model_name
         self._capacity = capacity
         self._profile_path = profile_path or _find_profile(model_name)
@@ -148,6 +149,7 @@ class Server:
         self._model_id = model_name.split("/")[-1]
         self._max_tokens = max_tokens
         self._max_input_tokens = max_input_tokens
+        self._kv_bits = kv_bits
 
     def load(self):
         session = FlashSession(
@@ -164,9 +166,12 @@ class Server:
     def _stream(self, prompt: str, max_tokens: int, **sampling):
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
+        kv_kwargs = {}
+        if self._kv_bits is not None:
+            kv_kwargs = dict(kv_bits=self._kv_bits, kv_group_size=64, quantized_kv_start=0)
         yield from _mlx_lm.stream_generate(
             self._model, self._tokenizer, prompt=prompt, max_tokens=max_tokens,
-            sampler=make_sampler(**sampling),
+            sampler=make_sampler(**sampling), **kv_kwargs,
         )
 
     def _tokenize_messages(self, messages: list, tools: list | None = None) -> str:
@@ -549,12 +554,14 @@ class Server:
 def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                capacity: int | None = None, profile_path: str | None = None,
                max_tokens: int = MAX_TOKENS_CAP,
-               max_input_tokens: int = MAX_INPUT_TOKENS):
+               max_input_tokens: int = MAX_INPUT_TOKENS,
+               kv_bits: int | None = None):
     import uvicorn
     from contextlib import asynccontextmanager
 
     server = Server(model_name, capacity=capacity, profile_path=profile_path,
-                    max_tokens=max_tokens, max_input_tokens=max_input_tokens)
+                    max_tokens=max_tokens, max_input_tokens=max_input_tokens,
+                    kv_bits=kv_bits)
 
     print(f"flash-moe serve")
     print(f"  Model:    {model_name}")

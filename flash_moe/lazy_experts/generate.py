@@ -183,7 +183,8 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
                    cache_dir: str | None = None,
                    profile_path: str | None = None,
                    prepacked: bool = True,
-                   capacity: int | None = None) -> str:
+                   capacity: int | None = None,
+                   kv_bits: int | None = None) -> str:
     """One-call generation with all optimizations.
 
     Args:
@@ -194,6 +195,8 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
         profile_path: Path to universal expert profile JSON for pinning.
         prepacked: Save/load prepacked weight files for fastest warm start.
         capacity: Experts per layer. None = auto-select based on available RAM.
+        kv_bits: Quantize KV cache to this many bits (8 recommended). Saves ~45%
+            KV memory at 8-bit. None = fp16 (default).
 
     Returns:
         Generated text string.
@@ -204,15 +207,20 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
         model_name, prompt, cache_dir=cache_dir,
         profile_path=profile_path, prepacked=prepacked, capacity=capacity)
 
+    kv_kwargs = {}
+    if kv_bits is not None:
+        kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
+
     return _mlx_lm.generate(model, tokenizer, prompt=prompt,
-                             max_tokens=max_tokens, verbose=False)
+                             max_tokens=max_tokens, verbose=False, **kv_kwargs)
 
 
 def flash_stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
                           cache_dir: str | None = None,
                           profile_path: str | None = None,
                           prepacked: bool = True,
-                          capacity: int | None = None):
+                          capacity: int | None = None,
+                          kv_bits: int | None = None):
     """Streaming variant of flash_generate.
 
     Startup is blocking. After startup, yields GenerationResponse objects
@@ -227,8 +235,12 @@ def flash_stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
         model_name, prompt, cache_dir=cache_dir,
         profile_path=profile_path, prepacked=prepacked, capacity=capacity)
 
+    kv_kwargs = {}
+    if kv_bits is not None:
+        kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
+
     yield from _mlx_lm.stream_generate(model, tokenizer, prompt=prompt,
-                                        max_tokens=max_tokens)
+                                        max_tokens=max_tokens, **kv_kwargs)
 
 
 class FlashSession:
@@ -248,12 +260,13 @@ class FlashSession:
 
     def __init__(self, model_name: str, cache_dir: str | None = None,
                  profile_path: str | None = None, prepacked: bool = True,
-                 capacity: int | None = None):
+                 capacity: int | None = None, kv_bits: int | None = None):
         self._model_name = model_name
         self._cache_dir = cache_dir
         self._profile_path = profile_path
         self._prepacked = prepacked
         self._capacity = capacity
+        self._kv_bits = kv_bits
         self._model = None
         self._tokenizer = None
         self._model_path = None
@@ -274,13 +287,19 @@ class FlashSession:
             print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
             self._last_prompt = prompt
 
+    def _kv_kwargs(self):
+        if self._kv_bits is None:
+            return {}
+        return dict(kv_bits=self._kv_bits, kv_group_size=64, quantized_kv_start=0)
+
     def stream(self, prompt: str, max_tokens: int = 200):
         """Stream tokens for a single turn."""
         import mlx_lm as _mlx_lm
 
         self._ensure_loaded(prompt)
         yield from _mlx_lm.stream_generate(self._model, self._tokenizer,
-                                            prompt=prompt, max_tokens=max_tokens)
+                                            prompt=prompt, max_tokens=max_tokens,
+                                            **self._kv_kwargs())
 
     def generate(self, prompt: str, max_tokens: int = 200) -> str:
         """Non-streaming generation for a single turn."""
@@ -288,7 +307,8 @@ class FlashSession:
 
         self._ensure_loaded(prompt)
         return _mlx_lm.generate(self._model, self._tokenizer,
-                                 prompt=prompt, max_tokens=max_tokens, verbose=False)
+                                 prompt=prompt, max_tokens=max_tokens, verbose=False,
+                                 **self._kv_kwargs())
 
     @property
     def memory_gb(self) -> float:

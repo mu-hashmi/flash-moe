@@ -17,6 +17,8 @@ def main():
                        help="Max output tokens per request (default: 4096)")
     serve.add_argument("--max-input-tokens", type=int, default=16384,
                        help="Max input tokens — rejects requests over this (default: 16384)")
+    serve.add_argument("--kv-bits", type=int, default=None,
+                       help="Quantize KV cache to N bits (8 recommended). Saves ~45%% KV memory.")
 
     args = parser.parse_args()
 
@@ -30,6 +32,7 @@ def main():
             profile_path=args.profile,
             max_tokens=args.max_tokens,
             max_input_tokens=args.max_input_tokens,
+            kv_bits=args.kv_bits,
         )
     else:
         parser.print_help()
