@@ -107,16 +107,28 @@ def _convert_tools_anthropic_to_openai(tools: list) -> list:
     } for t in tools]
 
 
-def _sampling_kwargs(body: dict) -> dict:
-    """Extract sampling params from request body."""
-    kwargs = {}
+MODEL_SAMPLING_DEFAULTS = {
+    "qwen3-coder": {"temp": 1.0, "top_p": 0.95, "top_k": 40},
+}
+
+
+def _sampling_defaults(model_name: str) -> dict:
+    slug = model_name.split("/")[-1].lower()
+    for prefix, defaults in MODEL_SAMPLING_DEFAULTS.items():
+        if prefix in slug:
+            return dict(defaults)
+    return {}
+
+
+def _sampling_kwargs(body: dict, model_name: str) -> dict:
+    defaults = _sampling_defaults(model_name)
     if "temperature" in body:
-        kwargs["temp"] = float(body["temperature"])
+        defaults["temp"] = float(body["temperature"])
     if "top_p" in body:
-        kwargs["top_p"] = float(body["top_p"])
+        defaults["top_p"] = float(body["top_p"])
     if "top_k" in body:
-        kwargs["top_k"] = int(body["top_k"])
-    return kwargs
+        defaults["top_k"] = int(body["top_k"])
+    return defaults
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
@@ -219,7 +231,7 @@ class Server:
         max_tokens = min(raw if raw is not None else self._max_tokens, self._max_tokens)
         stream = body.get("stream", False)
         tools = body.get("tools")
-        sampling = _sampling_kwargs(body)
+        sampling = _sampling_kwargs(body, self._model_name)
 
         formatted = _format_messages(messages)
         prompt = self._tokenize_messages(formatted, tools=tools)
@@ -265,7 +277,7 @@ class Server:
             )
         max_tokens = min(body.get("max_tokens", self._max_tokens), self._max_tokens)
         stream = body.get("stream", False)
-        sampling = _sampling_kwargs(body)
+        sampling = _sampling_kwargs(body, self._model_name)
 
         tools_anthropic = body.get("tools")
         tools_openai = _convert_tools_anthropic_to_openai(tools_anthropic) if tools_anthropic else None
@@ -567,7 +579,10 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
     print(f"  Model:    {model_name}")
     print(f"  Profile:  {server._profile_path or 'none'}")
     print(f"  Endpoint: http://{host}:{port}")
+    defaults = _sampling_defaults(model_name)
     print(f"  Limits:   {max_input_tokens} input, {max_tokens} output")
+    if defaults:
+        print(f"  Sampling: {defaults}")
     print()
     print("Loading model...")
     server.load()

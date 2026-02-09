@@ -41,7 +41,7 @@ Endpoints:
 
 Options: `--port`, `--host`, `--capacity`, `--profile`, `--kv-bits`.
 
-Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from the request body. Set them in your client config — the server doesn't impose model-specific defaults.
+Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from the request body. When not specified, the server applies model-recommended defaults (e.g. `temp=1.0, top_p=0.95, top_k=40` for Qwen3-Coder). Client values always override.
 
 ### Python API
 

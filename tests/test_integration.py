@@ -554,7 +554,7 @@ class TestServerEndpoints:
         from mlx_moe.server import _sampling_kwargs
 
         body = {"temperature": 0.7, "top_p": 0.9, "top_k": 40}
-        kwargs = _sampling_kwargs(body)
+        kwargs = _sampling_kwargs(body, "some/unknown-model")
         assert kwargs["temp"] == 0.7
         assert kwargs["top_p"] == 0.9
         assert kwargs["top_k"] == 40
@@ -562,7 +562,21 @@ class TestServerEndpoints:
     def test_sampling_kwargs_empty(self):
         from mlx_moe.server import _sampling_kwargs
 
-        assert _sampling_kwargs({}) == {}
+        assert _sampling_kwargs({}, "some/unknown-model") == {}
+
+    def test_sampling_kwargs_model_defaults(self):
+        from mlx_moe.server import _sampling_kwargs
+
+        kwargs = _sampling_kwargs({}, "mlx-community/Qwen3-Coder-Next-4bit")
+        assert kwargs == {"temp": 1.0, "top_p": 0.95, "top_k": 40}
+
+    def test_sampling_kwargs_client_overrides_defaults(self):
+        from mlx_moe.server import _sampling_kwargs
+
+        kwargs = _sampling_kwargs({"temperature": 0.5}, "mlx-community/Qwen3-Coder-Next-4bit")
+        assert kwargs["temp"] == 0.5
+        assert kwargs["top_p"] == 0.95
+        assert kwargs["top_k"] == 40
 
     def test_strip_thinking(self):
         from mlx_moe.server import _strip_thinking
