@@ -226,6 +226,7 @@ def load_prepacked_weights(model, prepacked_path: str | Path,
                 pred_cache._shard_paths[proj_name] = shard_map[f"{key_prefix}.weight"]
                 pred_cache._key_prefixes[proj_name] = key_prefix
             pred_cache._shard_map = shard_map
+            pred_cache._st_map = getattr(model, "_st_map", None)
 
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             p2 = getattr(switch, proj_name)

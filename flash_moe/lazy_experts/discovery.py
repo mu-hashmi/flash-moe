@@ -63,7 +63,7 @@ def router_only_forward(model, tokenizer, prompt: str,
 
             gates = self.gate(x)
             gates = mx.softmax(gates, axis=-1, precise=True)
-            k = self.top_k
+            k = getattr(self, "top_k", None) or self.num_experts_per_tok
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
             mx.eval(inds)
             flat = np.asarray(inds.reshape(-1))
@@ -140,7 +140,7 @@ def router_only_discovery(model, tokenizer, prompt: str,
 
             gates = self.gate(x)
             gates = mx.softmax(gates, axis=-1, precise=True)
-            k = self.top_k
+            k = getattr(self, "top_k", None) or self.num_experts_per_tok
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
             collected[layer_idx].append(inds)
 
@@ -252,7 +252,7 @@ def speculative_router_probe(model, tokenizer, prompt: str,
 
             gates = self.gate(x)
             gates = mx.softmax(gates, axis=-1, precise=True)
-            k = self.top_k
+            k = getattr(self, "top_k", None) or self.num_experts_per_tok
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
 
             if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):

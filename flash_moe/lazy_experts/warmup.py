@@ -12,7 +12,9 @@ from .loading import (
     _find_moe_block,
     _build_shard_map,
     _load_proj_experts,
+    _load_experts,
     _with_cache_limit_zero,
+    SafetensorsMap,
 )
 from .modules import (
     PredictiveCachedSwitchLinear,
@@ -140,17 +142,19 @@ def delta_warmup(model, tokenizer, model_path, new_prompt,
             shard_groups.setdefault(sp, []).append((i, proj_name, kp, new_eids))
 
     loaded_experts: dict[int, dict[str, tuple]] = {}
+    st_map = getattr(model, "_st_map", None)
 
     for shard_path, group in shard_groups.items():
-        shard = mx.load(shard_path)
+        shard = None if st_map is not None else mx.load(shard_path)
 
         layers_in_batch = sorted(set(li for li, _, _, _ in group))
         for layer_i in layers_in_batch:
             layer_entries = [(pn, kp, eids) for li, pn, kp, eids in group if li == layer_i]
             to_eval = []
             for proj_name, key_prefix, new_eids in layer_entries:
-                new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
-                                                          shard_map=shard_map)
+                new_w, new_s, new_b = _load_experts(key_prefix, new_eids,
+                                                     shard=shard, shard_map=shard_map,
+                                                     st_map=st_map)
                 loaded_experts.setdefault(layer_i, {})[proj_name] = (new_w, new_s, new_b)
                 to_eval.extend([new_w, new_s])
                 if new_b is not None:
@@ -189,12 +193,9 @@ def delta_warmup(model, tokenizer, model_path, new_prompt,
             cache.frequency.pop(old_eid, None)
             cache.last_active.pop(old_eid, None)
 
-        lookup_np = np.zeros(cache.num_experts, dtype=np.int32)
-        for slot, eid in enumerate(cache.cached_ids):
-            lookup_np[eid] = slot
-        cache.lookup = mx.array(lookup_np)
+        cache.rebuild_lookup()
 
-        to_eval = [cache.lookup]
+        to_eval = [cache.lookup, cache.hit_mask]
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             to_eval.append(cache.weights[proj_name])
             to_eval.append(cache.scales[proj_name])
@@ -362,13 +363,14 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
 
     t_shard_load = 0.0
     t_scatter = 0.0
+    st_map = getattr(model, "_st_map", None)
 
     _default_cache = mx.device_info()["memory_size"] // 4
     mx.set_cache_limit(256 * 1024 * 1024)
 
     for shard_path, layer_set in shard_layers.items():
         t_load_start = time.perf_counter()
-        shard = mx.load(shard_path)
+        shard = None if st_map is not None else mx.load(shard_path)
         t_shard_load += time.perf_counter() - t_load_start
 
         for layer_i in sorted(layer_set):
@@ -384,8 +386,9 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
                 key_prefix = cache._key_prefixes[proj_name]
                 if cache._shard_paths[proj_name] != shard_path:
                     continue
-                new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
-                                                          shard_map=cache._shard_map)
+                new_w, new_s, new_b = _load_experts(key_prefix, new_eids,
+                                                     shard=shard, shard_map=cache._shard_map,
+                                                     st_map=st_map)
                 loaded[proj_name] = (new_w, new_s, new_b)
                 to_eval.extend([new_w, new_s])
                 if new_b is not None:
@@ -451,12 +454,10 @@ def fast_delta_warmup(model, tokenizer, model_path, new_prompt,
             cache.frequency.pop(old_eid, None)
             cache.last_active.pop(old_eid, None)
 
-        lookup_np = np.zeros(cache.num_experts, dtype=np.int32)
-        for slot, eid in enumerate(cache.cached_ids):
-            lookup_np[eid] = slot
-        cache.lookup = mx.array(lookup_np)
+        cache.rebuild_lookup()
 
         batch_eval.append(cache.lookup)
+        batch_eval.append(cache.hit_mask)
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             batch_eval.append(cache.weights[proj_name])
             batch_eval.append(cache.scales[proj_name])
@@ -695,12 +696,14 @@ class IncrementalDeltaWarmup:
             plan = self._swap_queue.pop(0)
             cache = plan.cache
 
+            st_map = getattr(self._model, "_st_map", None)
             for proj_name in ("gate_proj", "up_proj", "down_proj"):
                 shard_path = cache._shard_paths[proj_name]
                 key_prefix = cache._key_prefixes[proj_name]
-                shard = mx.load(shard_path)
-                new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, plan.new_eids,
-                                                          shard_map=cache._shard_map)
+                shard = mx.load(shard_path) if st_map is None else None
+                new_w, new_s, new_b = _load_experts(key_prefix, plan.new_eids,
+                                                     shard=shard, shard_map=cache._shard_map,
+                                                     st_map=st_map)
                 del shard
 
                 w = cache.weights.pop(proj_name)
@@ -723,10 +726,7 @@ class IncrementalDeltaWarmup:
                 cache.frequency.pop(old_eid, None)
                 cache.last_active.pop(old_eid, None)
 
-            lookup_np = np.zeros(cache.num_experts, dtype=np.int32)
-            for slot, eid in enumerate(cache.cached_ids):
-                lookup_np[eid] = slot
-            cache.lookup = mx.array(lookup_np)
+            cache.rebuild_lookup()
 
             self._layers_done += 1
             self._swaps_done += len(plan.swaps)

@@ -4,7 +4,8 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
-from .loading import _load_proj_experts
+from .loading import _load_proj_experts, _load_experts
+
 
 
 class ExpertCache:
@@ -234,12 +235,13 @@ class PredictiveExpertCache:
     Supports dynamic updates between tokens: captures router indices during
     forward pass, then swaps cold experts for newly-requested ones.
     """
-    __slots__ = ('capacity', 'num_experts', 'lookup',
+    __slots__ = ('capacity', 'num_experts', 'lookup', 'hit_mask',
                  'weights', 'scales', 'biases',
                  'cached_ids', 'cached_set',
                  'frequency', 'last_active', 'step',
                  '_indices_buffer',
                  '_shard_paths', '_key_prefixes', '_shard_map',
+                 '_st_map',
                  'total_requests', 'total_fallbacks',
                  'pinned_set')
 
@@ -250,6 +252,7 @@ class PredictiveExpertCache:
         self.scales: dict[str, mx.array] = {}
         self.biases: dict[str, mx.array | None] = {}
         self.lookup: mx.array | None = None
+        self.hit_mask: mx.array | None = None
         self.cached_ids: list[int] = []
         self.cached_set: set[int] = set()
         self.frequency: dict[int, int] = {}
@@ -259,28 +262,33 @@ class PredictiveExpertCache:
         self._shard_paths: dict[str, str] = {}
         self._key_prefixes: dict[str, str] = {}
         self._shard_map: dict[str, str] | None = None
+        self._st_map = None
         self.total_requests: int = 0
         self.total_fallbacks: int = 0
         self.pinned_set: set[int] = set()
 
     def build_lookup(self, cached_ids: list[int]) -> None:
-        """Build GPU-resident lookup table mapping global expert IDs to cache slots.
+        """Build GPU-resident lookup table and hit mask from cached expert IDs.
 
-        Uncached IDs map to slot 0 (fallback). Must be called after populating
-        the weight tensors.
-
-        Args:
-            cached_ids: Ordered list of expert IDs loaded into cache slots.
+        Uncached IDs map to slot 0 (fallback) in the lookup table and 0.0 in
+        the hit mask. Must be called after populating the weight tensors.
         """
         self.cached_ids = list(cached_ids)
         self.cached_set = set(cached_ids)
         for eid in cached_ids:
             self.frequency.setdefault(eid, 1)
             self.last_active.setdefault(eid, 0)
+        self.rebuild_lookup()
+
+    def rebuild_lookup(self) -> None:
+        """Rebuild lookup table and hit mask from current cached_ids."""
         lookup_np = np.zeros(self.num_experts, dtype=np.int32)
-        for slot, eid in enumerate(cached_ids):
+        hit_np = np.zeros(self.num_experts, dtype=np.float32)
+        for slot, eid in enumerate(self.cached_ids):
             lookup_np[eid] = slot
+            hit_np[eid] = 1.0
         self.lookup = mx.array(lookup_np)
+        self.hit_mask = mx.array(hit_np)
 
     def remap(self, indices: mx.array) -> mx.array:
         """Map global expert IDs to cache slots. Pure mx.array op, no eval."""
@@ -354,9 +362,10 @@ class PredictiveExpertCache:
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             shard_path = self._shard_paths[proj_name]
             key_prefix = self._key_prefixes[proj_name]
-            shard = mx.load(shard_path)
-            new_w, new_s, new_b = _load_proj_experts(shard, key_prefix, new_eids,
-                                                      shard_map=self._shard_map)
+            shard = mx.load(shard_path) if self._st_map is None else None
+            new_w, new_s, new_b = _load_experts(key_prefix, new_eids,
+                                                 shard=shard, shard_map=self._shard_map,
+                                                 st_map=self._st_map)
             del shard
 
             if new_b is None:
@@ -386,11 +395,8 @@ class PredictiveExpertCache:
             self.frequency.pop(old_eid, None)
             self.last_active.pop(old_eid, None)
 
-        lookup_np = np.zeros(self.num_experts, dtype=np.int32)
-        for slot, eid in enumerate(self.cached_ids):
-            lookup_np[eid] = slot
-        self.lookup = mx.array(lookup_np)
-        mx.eval(self.lookup)
+        self.rebuild_lookup()
+        mx.eval(self.lookup, self.hit_mask)
 
         return {"swaps": len(swaps), "fallbacks": n_fallbacks, "requests": n_requests}
 
@@ -470,3 +476,5 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
+
+
