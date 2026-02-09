@@ -15,6 +15,15 @@ dependencies = [
 [project.scripts]
 mlx-moe = "mlx_moe.cli:main"
 
+[dependency-groups]
+dev = [
+    "pytest",
+    "httpx",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

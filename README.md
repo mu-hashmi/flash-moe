@@ -239,6 +239,23 @@ output = mlx_lm.generate(model, tokenizer, prompt="Write a Flask server",
                           max_tokens=200, verbose=False)
 ```
 
+## Testing
+
+```bash
+uv run pytest                # 100 tests, ~0.5s (no model download needed)
+```
+
+The test suite covers unit tests (ExpertCache, select_capacity, module detection, persistence roundtrips) and integration tests (synthetic 8-expert model through the full lazy → predictive → generate pipeline, skip-fallback with cache misses, golden reference comparison, server endpoints).
+
+Smoke tests against real models are in `benchmarks/` and run manually:
+
+```bash
+uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit
+uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit --capacity 208 --tokens 50
+```
+
+These take minutes (model download + cold start + generation) and require a Mac with enough RAM for the model.
+
 ## Known Limitations
 
 - **Quality cliff below capacity 192** — garbled output regardless of warmup (Qwen)
