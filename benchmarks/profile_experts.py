@@ -31,11 +31,6 @@ from flash_moe.lazy_experts import (
 
 MODEL_PRESETS = {
     "qwen": ("mlx-community/Qwen3-Coder-Next-4bit", 208),
-    "mixtral": ("mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit", 6),
-    "mixtral-8x22b": ("mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit", 2),
-    "glm": ("mlx-community/GLM-4.7-Flash-4bit", 48),
-    "qwen2-moe": ("mlx-community/Qwen2-57B-A14B-Instruct-4bit", 32),
-    "qwen3-30b": ("mlx-community/Qwen3-30B-A3B-4bit", 128),
 }
 
 WARMUP_TOKENS = 10
