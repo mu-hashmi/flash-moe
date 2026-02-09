@@ -4,7 +4,7 @@ Runs warmup + upgrade cycles for each prompt, records per-layer expert activatio
 and identifies "universal" experts activated in >threshold fraction of prompts.
 
 Usage:
-    PATH_REMOVED profile_experts.py [--model MODEL] [--capacity N] [--threshold F] [--output PATH]
+    uv run python benchmarks/profile_experts.py [--model MODEL] [--capacity N] [--threshold F] [--output PATH]
 
     MODEL shortcuts: qwen, mixtral, glm (or any HuggingFace model name)
 
