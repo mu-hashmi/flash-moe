@@ -81,16 +81,6 @@ def _startup(model_name, prompt, cache_dir=None, profile_path=None,
                                    num_moe_layers=num_moe_layers,
                                    expert_slot_mb=expert_slot_mb)
 
-        # Verify projected upgrade peak won't exceed gc_limit. The upgrade
-        # phase uses scatter double-buffering (old + new stacked tensors
-        # alive simultaneously), adding ~30% to active memory at peak.
-        slot_gb = num_moe_layers * expert_slot_mb / 1024
-        while capacity > 8:
-            projected_active = base_gb + capacity * slot_gb
-            if projected_active * 1.3 <= gc_limit_gb:
-                break
-            capacity -= 8
-
     if num_experts > 0:
         capacity = min(capacity, num_experts)
 
