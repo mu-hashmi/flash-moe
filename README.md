@@ -67,7 +67,7 @@ Endpoints:
 - `POST /v1/messages` — Anthropic Messages API (SSE streaming)
 - `GET /v1/models` — model discovery
 
-Options: `--port`, `--host`, `--capacity`, `--profile`.
+Options: `--port`, `--host`, `--capacity`, `--profile`, `--kv-bits`.
 
 Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from the request body. Set them in your client config — the server doesn't impose model-specific defaults.
 
@@ -152,6 +152,27 @@ uv run python benchmarks/profile_experts.py --model mlx-community/Some-MoE-Model
 | Cold start (no profile, router discovery) | ~17s |
 | Domain switch (delta warmup) | ~2-3s |
 
+### KV Cache Quantization
+
+Quantize the KV cache to 8-bit to reduce memory for longer contexts. Saves ~45% KV memory with no quality degradation.
+
+```python
+text = flash_generate("mlx-community/Qwen3-Coder-Next-4bit",
+                       "Your prompt", kv_bits=8)
+
+# Or via the server
+# flash-moe serve mlx-community/Qwen3-Coder-Next-4bit --kv-bits 8
+```
+
+| Context Length | fp16 KV | 8-bit KV |
+|---------------|--------:|---------:|
+| 4K tokens | 384 MB | ~210 MB |
+| 8K tokens | 768 MB | ~420 MB |
+| 16K tokens | 1.5 GB | ~820 MB |
+| 32K tokens | 3.0 GB | ~1.6 GB |
+
+Uses mlx-lm's `QuantizedKVCache` with `quantized_kv_start=0` (quantize from the first token). Available on all APIs: `flash_generate`, `flash_stream_generate`, `FlashSession`, and `flash-moe serve`.
+
 ### Multi-Turn Stability
 
 Tested over 20 turns with varied prompts:
@@ -172,6 +193,7 @@ text = flash_generate(
     max_tokens=200,
     cache_dir="~/.cache/flash-moe",                  # persist state between runs
     profile_path="profiles/qwen3-coder-next.json",    # enable pinning
+    kv_bits=8,                                        # quantize KV cache (optional)
 )
 ```
 
