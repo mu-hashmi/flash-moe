@@ -7,52 +7,24 @@ Run large Mixture-of-Experts models on memory-constrained Macs by loading only r
 ```bash
 git clone https://github.com/mu-hashmi/mlx-moe.git
 cd mlx-moe
+pip install .
+```
+
+For development:
+
+```bash
 uv sync
 ```
 
-```python
-uv run python -c "
-from mlx_moe import generate
-print(generate('mlx-community/Qwen3-Coder-Next-4bit',
-                      'Write a Python hello world program',
-                      max_tokens=200))
-"
-```
+### Server
 
-Streaming:
-
-```python
-uv run python -c "
-from mlx_moe import stream_generate
-for response in stream_generate('mlx-community/Qwen3-Coder-Next-4bit',
-                                       'Write a Flask server', max_tokens=200):
-    print(response.text, end='', flush=True)
-"
-```
-
-Multi-turn sessions:
-
-```python
-uv run python -c "
-from mlx_moe import Session
-session = Session('mlx-community/Qwen3-Coder-Next-4bit',
-                       cache_dir='~/.cache/mlx-moe')
-for response in session.stream('Write a linked list in Python'):
-    print(response.text, end='', flush=True)
-print()
-print(session.generate('Now add type hints'))
-"
-```
-
-First launch downloads the model (~24 GB) and warms up experts (~13s). Subsequent launches: ~6s to first token.
-
-## API Server
+Start an OpenAI- and Anthropic-compatible API server:
 
 ```bash
 mlx-moe serve mlx-community/Qwen3-Coder-Next-4bit
 ```
 
-Starts an OpenAI- and Anthropic-compatible API server on `http://127.0.0.1:8080`. Point any compatible client at it:
+Point any compatible client at `http://127.0.0.1:8080`:
 
 ```bash
 # OpenAI-compatible clients
@@ -70,6 +42,41 @@ Endpoints:
 Options: `--port`, `--host`, `--capacity`, `--profile`, `--kv-bits`.
 
 Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from the request body. Set them in your client config — the server doesn't impose model-specific defaults.
+
+### Python API
+
+```python
+from mlx_moe import generate
+
+print(generate("mlx-community/Qwen3-Coder-Next-4bit",
+               "Write a Python hello world program",
+               max_tokens=200))
+```
+
+Streaming:
+
+```python
+from mlx_moe import stream_generate
+
+for response in stream_generate("mlx-community/Qwen3-Coder-Next-4bit",
+                                "Write a Flask server", max_tokens=200):
+    print(response.text, end="", flush=True)
+```
+
+Multi-turn sessions:
+
+```python
+from mlx_moe import Session
+
+session = Session("mlx-community/Qwen3-Coder-Next-4bit",
+                  cache_dir="~/.cache/mlx-moe")
+for response in session.stream("Write a linked list in Python"):
+    print(response.text, end="", flush=True)
+print()
+print(session.generate("Now add type hints"))
+```
+
+First launch downloads the model (~24 GB) and warms up experts (~13s). Subsequent launches: ~6s to first token.
 
 ## Supported Models
 
@@ -252,6 +259,13 @@ Smoke tests against real models are in `benchmarks/` and run manually:
 ```bash
 uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit
 uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit --capacity 208 --tokens 50
+```
+
+Quality and memory validation across diverse prompts:
+
+```bash
+uv run python benchmarks/validate_quality.py quality    # diverse prompt quality test
+uv run python benchmarks/validate_quality.py memory     # memory growth over 500 tokens
 ```
 
 These take minutes (model download + cold start + generation) and require a Mac with enough RAM for the model.

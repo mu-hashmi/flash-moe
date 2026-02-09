@@ -7,23 +7,27 @@ mlx-moe enables large MoE models to run on memory-constrained Macs by loading on
 ## Project Structure
 
 ```
-mlx_moe/                  # The package (pip-installable)
+mlx_moe/                    # The package (pip-installable)
   __init__.py               # Exports: generate, stream_generate, Session
   lazy_experts/             # Core implementation
-    core.py                 # enable/upgrade/reset, cache stats, dynamic refresh
+    core.py                 # enable/upgrade/reset, cache stats, skip-fallback
     modules.py              # ExpertCache, Lazy/Cached/Predictive module classes
     loading.py              # Weight loading, shard maps, capacity selection
     discovery.py            # Router-only discovery, speculative probes
     warmup.py               # Delta warmup, incremental warmup
     persistence.py          # Cache state save/load, prepacked weights, profiles
-    generate.py             # generate, stream_generate, Session
+    generate.py             # generate, stream_generate, Session, _startup
 
   cli.py                    # CLI entry point: mlx-moe serve
   server.py                 # OpenAI + Anthropic API server (Starlette + uvicorn)
 
-benchmarks/                 # Profiling and benchmark scripts
+tests/                      # Automated test suite (uv run pytest)
+  test_unit_core.py         # ExpertCache, PredictiveExpertCache, select_capacity, module detection
+  test_unit_persistence.py  # save/load roundtrips, SafetensorsMap
+  test_integration.py       # Synthetic 8-expert model pipeline, server endpoints
+
+benchmarks/                 # Performance benchmarks and smoke tests (run manually)
 profiles/                   # Pre-computed expert profiles (auto-detected by model name)
-universal_experts.json      # Pre-computed Qwen expert profile (saves 33 min)
 ```
 
 Depends on stock `mlx-lm >= 0.30.0` — no fork needed. Uses `mlx-lm` for model loading (`mlx_lm.load`), generation (`mlx_lm.generate`, `mlx_lm.stream_generate`), and the `QuantizedSwitchLinear` base class.
@@ -34,27 +38,19 @@ This is a uv project. Python 3.13.
 
 ```bash
 uv sync
+uv run pytest                # 100 tests, ~0.5s
 uv run python -c "from mlx_moe import generate; print('ok')"
 ```
 
-## Running Benchmarks
+## Testing
 
 ```bash
-# Expert profiling (22 prompts, ~33 min for Qwen, ~7 min for Mixtral/GLM)
-uv run python benchmarks/profile_experts.py --model qwen
-uv run python benchmarks/profile_experts.py --model mixtral --output benchmarks/mixtral_experts.json
+uv run pytest                # unit + integration tests (no model download needed)
+uv run pytest -v             # verbose output
 
-# Multi-turn session benchmark
-uv run python benchmarks/bench_multiturn.py --model qwen --turns 20 --tokens 200
-
-# Pinning benchmark (4 configs × N tokens)
-uv run python benchmarks/bench_pinning.py --model glm --profile benchmarks/glm_experts.json
-
-# Adaptive per-layer budget
-uv run python benchmarks/bench_adaptive.py --model qwen --profile universal_experts.json
-
-# Context growth (accumulating conversation history)
-uv run python benchmarks/bench_context_growth.py --model qwen --turns 10
+# Smoke tests against real models (manual, takes minutes)
+uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit
+uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit --capacity 208 --tokens 50
 ```
 
 ## Architecture
@@ -66,6 +62,10 @@ uv run python benchmarks/bench_context_growth.py --model qwen --turns 10
 3. Expert warmup via router-only discovery (~1s) or pre-computed profile (0s)
 4. `upgrade_to_predictive()` loads top experts into GPU-resident stacked tensors
 5. Generation uses zero-eval forward pass with pre-stacked expert lookup tables
+
+### Auto Capacity Selection
+
+`select_capacity()` uses Metal's `max_recommended_working_set_size` (hardware-reported, not a percentage of system RAM) to pick the right number of experts. Targets 71% of the recommended limit, leaving headroom for KV cache growth. Expert slot sizes include weight + scales + biases (all quantization metadata). After upgrade, `mx.get_peak_memory()` is checked against `gc_limit` (0.95 × recommended) and warns if exceeded.
 
 ### Supported Models
 
@@ -86,7 +86,7 @@ Any MLX model using `SwitchGLU` with either module path:
 ## API Server (`mlx-moe serve`)
 
 ```bash
-mlx-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH] [--max-tokens N] [--max-input-tokens N]
+mlx-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH] [--max-tokens N] [--max-input-tokens N] [--kv-bits N]
 ```
 
 Endpoints: `/v1/chat/completions` (OpenAI), `/v1/messages` (Anthropic), `/v1/models`.
