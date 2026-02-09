@@ -54,7 +54,7 @@ wheels = [
 ]
 
 [[package]]
-name = "flash-moe"
+name = "mlx-moe"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

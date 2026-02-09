@@ -23,7 +23,7 @@ import mlx.core as mx
 import mlx_lm
 import numpy as np
 from mlx_lm.utils import hf_repo_to_path
-from flash_moe.lazy_experts import (
+from mlx_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, reset_to_cached,
     _find_switch_mlp, _detect_num_experts,
     CachedQuantizedSwitchLinear, PredictiveCachedSwitchLinear,

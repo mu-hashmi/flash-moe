@@ -15,7 +15,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from .lazy_experts.generate import FlashSession
+from .lazy_experts.generate import Session
 
 import sys
 if not sys.stdout.isatty():
@@ -152,9 +152,9 @@ class Server:
         self._kv_bits = kv_bits
 
     def load(self):
-        session = FlashSession(
+        session = Session(
             self._model_name,
-            cache_dir=str(Path.home() / ".cache" / "flash-moe"),
+            cache_dir=str(Path.home() / ".cache" / "mlx-moe"),
             profile_path=self._profile_path,
             capacity=self._capacity,
         )
@@ -206,7 +206,7 @@ class Server:
             "data": [{
                 "id": self._model_id,
                 "object": "model",
-                "owned_by": "flash-moe",
+                "owned_by": "mlx-moe",
             }],
         })
 
@@ -563,7 +563,7 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                     max_tokens=max_tokens, max_input_tokens=max_input_tokens,
                     kv_bits=kv_bits)
 
-    print(f"flash-moe serve")
+    print(f"mlx-moe serve")
     print(f"  Model:    {model_name}")
     print(f"  Profile:  {server._profile_path or 'none'}")
     print(f"  Endpoint: http://{host}:{port}")

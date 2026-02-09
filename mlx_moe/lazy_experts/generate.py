@@ -31,9 +31,9 @@ from .persistence import (
 _WARMUP_CACHE = 256 * 1024 * 1024
 
 
-def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
+def _startup(model_name, prompt, cache_dir=None, profile_path=None,
                    prepacked=True, capacity=None):
-    """Shared startup for flash_generate and flash_stream_generate.
+    """Shared startup for generate and stream_generate.
 
     Returns (model, tokenizer, model_path) with all warmup/upgrade/wiring done.
     """
@@ -60,22 +60,36 @@ def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
             if expert_slot_mb == 0.0:
                 proj = getattr(switch, "gate_proj", None) or getattr(switch, "up_proj", None)
                 if proj is not None and hasattr(proj, "weight"):
-                    w = proj.weight
-                    expert_bytes = w.nbytes // num_experts
-                    expert_slot_mb = expert_bytes * 3 / 1e6
+                    per_expert = proj.weight.nbytes // num_experts
+                    for attr in ("scales", "biases"):
+                        t = getattr(proj, attr, None)
+                        if t is not None:
+                            per_expert += t.nbytes // num_experts
+                    expert_slot_mb = per_expert * 3 / 1e6
+
+    recommended_gb = mx.device_info()["max_recommended_working_set_size"] / 1e9
+    gc_limit_gb = recommended_gb * 0.95
 
     if capacity is None:
-        device_gb = mx.device_info()["memory_size"] / 1e9
-
         enable_lazy_experts(model, model_path,
                             cache_capacity_per_layer=0,
                             predictive=True)
         mx.eval(model.parameters())
         base_gb = mx.get_active_memory() / 1e9
 
-        capacity = select_capacity(base_gb, device_gb,
+        capacity = select_capacity(base_gb, recommended_gb,
                                    num_moe_layers=num_moe_layers,
                                    expert_slot_mb=expert_slot_mb)
+
+        # Verify projected upgrade peak won't exceed gc_limit. The upgrade
+        # phase uses scatter double-buffering (old + new stacked tensors
+        # alive simultaneously), adding ~30% to active memory at peak.
+        slot_gb = num_moe_layers * expert_slot_mb / 1024
+        while capacity > 8:
+            projected_active = base_gb + capacity * slot_gb
+            if projected_active * 1.3 <= gc_limit_gb:
+                break
+            capacity -= 8
 
     if num_experts > 0:
         capacity = min(capacity, num_experts)
@@ -106,6 +120,7 @@ def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
         prepacked_path = cache_path.replace(".json", ".weights.safetensors")
 
     used_saved_state = False
+    mx.reset_peak_memory()
 
     if prepacked and prepacked_path and os.path.exists(prepacked_path):
         t0 = time.perf_counter()
@@ -154,6 +169,11 @@ def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
                 upgrade_to_predictive(model, model_path, capacity)
             print(f"  Router-only discovery + upgrade: {time.perf_counter() - t0:.1f}s")
 
+    peak_gb = mx.get_peak_memory() / 1e9
+    if peak_gb > gc_limit_gb:
+        print(f"  WARNING: upgrade peak {peak_gb:.1f} GB exceeded gc_limit {gc_limit_gb:.1f} GB")
+        print(f"  Generation may be slow. Try --capacity {max(8, capacity - 8)}")
+
     if cache_path and not used_saved_state:
         save_cache_state(model, cache_path,
                          metadata={"prompt": prompt, "capacity": capacity})
@@ -179,7 +199,7 @@ def _flash_startup(model_name, prompt, cache_dir=None, profile_path=None,
     return model, tokenizer, model_path
 
 
-def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
+def generate(model_name: str, prompt: str, max_tokens: int = 200,
                    cache_dir: str | None = None,
                    profile_path: str | None = None,
                    prepacked: bool = True,
@@ -203,7 +223,7 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
     """
     import mlx_lm as _mlx_lm
 
-    model, tokenizer, _ = _flash_startup(
+    model, tokenizer, _ = _startup(
         model_name, prompt, cache_dir=cache_dir,
         profile_path=profile_path, prepacked=prepacked, capacity=capacity)
 
@@ -215,13 +235,13 @@ def flash_generate(model_name: str, prompt: str, max_tokens: int = 200,
                              max_tokens=max_tokens, verbose=False, **kv_kwargs)
 
 
-def flash_stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
+def stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
                           cache_dir: str | None = None,
                           profile_path: str | None = None,
                           prepacked: bool = True,
                           capacity: int | None = None,
                           kv_bits: int | None = None):
-    """Streaming variant of flash_generate.
+    """Streaming variant of generate.
 
     Startup is blocking. After startup, yields GenerationResponse objects
     from mlx_lm.stream_generate.
@@ -231,7 +251,7 @@ def flash_stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
     """
     import mlx_lm as _mlx_lm
 
-    model, tokenizer, _ = _flash_startup(
+    model, tokenizer, _ = _startup(
         model_name, prompt, cache_dir=cache_dir,
         profile_path=profile_path, prepacked=prepacked, capacity=capacity)
 
@@ -243,15 +263,15 @@ def flash_stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
                                         max_tokens=max_tokens, **kv_kwargs)
 
 
-class FlashSession:
+class Session:
     """Reusable session for multi-turn generation.
 
     Loads the model once on first use. Subsequent calls reuse the loaded model
     and run delta warmup if the prompt domain changed.
 
     Usage:
-        session = FlashSession("mlx-community/Qwen3-Coder-Next-4bit",
-                               cache_dir="~/.cache/flash-moe")
+        session = Session("mlx-community/Qwen3-Coder-Next-4bit",
+                               cache_dir="~/.cache/mlx-moe")
         for resp in session.stream("Write a Flask server"):
             print(resp.text, end="")
         text = session.generate("Now add tests")
@@ -274,7 +294,7 @@ class FlashSession:
 
     def _ensure_loaded(self, prompt: str):
         if self._model is None:
-            self._model, self._tokenizer, self._model_path = _flash_startup(
+            self._model, self._tokenizer, self._model_path = _startup(
                 self._model_name, prompt, cache_dir=self._cache_dir,
                 profile_path=self._profile_path, prepacked=self._prepacked,
                 capacity=self._capacity)

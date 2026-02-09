@@ -22,7 +22,7 @@ def main():
 
     print("\nSkipping mx.eval — full model (46 GB) exceeds Metal memory (34 GB).")
     print("Previous attempt crashed: [METAL] Command buffer execution failed: Insufficient Memory")
-    print("This confirms why flash-moe is needed: the model cannot run normally on this hardware.")
+    print("This confirms why mlx-moe is needed: the model cannot run normally on this hardware.")
 
 
 if __name__ == "__main__":

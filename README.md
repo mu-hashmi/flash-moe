@@ -1,19 +1,19 @@
-# flash-moe
+# mlx-moe
 
 Run large Mixture-of-Experts models on memory-constrained Macs by loading only router-selected experts on demand from SSD. A 46 GB Qwen3-Coder-Next model runs on a 32 GB Mac at 6-23 tok/s using 19 GB, with coherent output through 1000+ tokens.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/mu-hashmi/flash-moe.git
-cd flash-moe
+git clone https://github.com/mu-hashmi/mlx-moe.git
+cd mlx-moe
 uv sync
 ```
 
 ```python
 uv run python -c "
-from flash_moe import flash_generate
-print(flash_generate('mlx-community/Qwen3-Coder-Next-4bit',
+from mlx_moe import generate
+print(generate('mlx-community/Qwen3-Coder-Next-4bit',
                       'Write a Python hello world program',
                       max_tokens=200))
 "
@@ -23,8 +23,8 @@ Streaming:
 
 ```python
 uv run python -c "
-from flash_moe import flash_stream_generate
-for response in flash_stream_generate('mlx-community/Qwen3-Coder-Next-4bit',
+from mlx_moe import stream_generate
+for response in stream_generate('mlx-community/Qwen3-Coder-Next-4bit',
                                        'Write a Flask server', max_tokens=200):
     print(response.text, end='', flush=True)
 "
@@ -34,9 +34,9 @@ Multi-turn sessions:
 
 ```python
 uv run python -c "
-from flash_moe import FlashSession
-session = FlashSession('mlx-community/Qwen3-Coder-Next-4bit',
-                       cache_dir='~/.cache/flash-moe')
+from mlx_moe import Session
+session = Session('mlx-community/Qwen3-Coder-Next-4bit',
+                       cache_dir='~/.cache/mlx-moe')
 for response in session.stream('Write a linked list in Python'):
     print(response.text, end='', flush=True)
 print()
@@ -49,17 +49,17 @@ First launch downloads the model (~24 GB) and warms up experts (~13s). Subsequen
 ## API Server
 
 ```bash
-flash-moe serve mlx-community/Qwen3-Coder-Next-4bit
+mlx-moe serve mlx-community/Qwen3-Coder-Next-4bit
 ```
 
 Starts an OpenAI- and Anthropic-compatible API server on `http://127.0.0.1:8080`. Point any compatible client at it:
 
 ```bash
 # OpenAI-compatible clients
-OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=flash-moe <your-client>
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=mlx-moe <your-client>
 
 # Anthropic-compatible clients
-ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=flash-moe <your-client>
+ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=mlx-moe <your-client>
 ```
 
 Endpoints:
@@ -73,7 +73,7 @@ Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from th
 
 ## Supported Models
 
-| Model | Experts | Top-K | MoE Layers | Full Size | flash-moe Memory | tok/s |
+| Model | Experts | Top-K | MoE Layers | Full Size | mlx-moe Memory | tok/s |
 |-------|--------:|------:|-----------:|---------:|-----------------:|------:|
 | [Qwen3-Coder-Next-4bit](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit) | 512 | 10 | 48 | 46 GB (OOM) | **19.1 GB** | 23 |
 
@@ -81,7 +81,7 @@ Any MLX model using `SwitchGLU` is supported — covers Qwen, Mixtral, GLM, Deep
 
 ### Which Models Benefit?
 
-flash-moe is valuable when a model **exceeds your Mac's RAM** and has favorable MoE architecture. Three factors predict whether output quality holds up at reduced expert coverage:
+mlx-moe is valuable when a model **exceeds your Mac's RAM** and has favorable MoE architecture. Three factors predict whether output quality holds up at reduced expert coverage:
 
 1. **High expert ratio** (expert_count / top_k ≥ 10) — more experts means more can stay on SSD
 2. **Shared expert** — provides a quality floor when routed experts miss
@@ -112,7 +112,7 @@ Models without a shared expert collapse to garbage below ~75% expert coverage. M
 
 ## How It Works
 
-Each MoE layer has hundreds of experts but only routes to a few per token (e.g. 10 out of 512 for Qwen). flash-moe replaces the expert weight modules with lazy-loading versions that:
+Each MoE layer has hundreds of experts but only routes to a few per token (e.g. 10 out of 512 for Qwen). mlx-moe replaces the expert weight modules with lazy-loading versions that:
 
 1. **Load the model without expert weights** (~1.4 GB instead of 46 GB)
 2. **Discover which experts matter** via router-only forward pass (~1s)
@@ -157,11 +157,11 @@ uv run python benchmarks/profile_experts.py --model mlx-community/Some-MoE-Model
 Quantize the KV cache to 8-bit to reduce memory for longer contexts. Saves ~45% KV memory with no quality degradation.
 
 ```python
-text = flash_generate("mlx-community/Qwen3-Coder-Next-4bit",
+text = generate("mlx-community/Qwen3-Coder-Next-4bit",
                        "Your prompt", kv_bits=8)
 
 # Or via the server
-# flash-moe serve mlx-community/Qwen3-Coder-Next-4bit --kv-bits 8
+# mlx-moe serve mlx-community/Qwen3-Coder-Next-4bit --kv-bits 8
 ```
 
 | Context Length | fp16 KV | 8-bit KV |
@@ -171,7 +171,7 @@ text = flash_generate("mlx-community/Qwen3-Coder-Next-4bit",
 | 16K tokens | 1.5 GB | ~820 MB |
 | 32K tokens | 3.0 GB | ~1.6 GB |
 
-Uses mlx-lm's `QuantizedKVCache` with `quantized_kv_start=0` (quantize from the first token). Available on all APIs: `flash_generate`, `flash_stream_generate`, `FlashSession`, and `flash-moe serve`.
+Uses mlx-lm's `QuantizedKVCache` with `quantized_kv_start=0` (quantize from the first token). Available on all APIs: `generate`, `stream_generate`, `Session`, and `mlx-moe serve`.
 
 ### Multi-Turn Stability
 
@@ -182,32 +182,32 @@ Tested over 20 turns with varied prompts:
 
 ## API
 
-### `flash_generate(model_name, prompt, **kwargs) -> str`
+### `generate(model_name, prompt, **kwargs) -> str`
 
 One-call generation. Auto-selects capacity, loads cached state, applies pinning.
 
 ```python
-text = flash_generate(
+text = generate(
     "mlx-community/Qwen3-Coder-Next-4bit",
     "Your prompt",
     max_tokens=200,
-    cache_dir="~/.cache/flash-moe",                  # persist state between runs
+    cache_dir="~/.cache/mlx-moe",                  # persist state between runs
     profile_path="profiles/qwen3-coder-next.json",    # enable pinning
     kv_bits=8,                                        # quantize KV cache (optional)
 )
 ```
 
-### `flash_stream_generate(model_name, prompt, **kwargs) -> Generator`
+### `stream_generate(model_name, prompt, **kwargs) -> Generator`
 
-Same as `flash_generate` but yields `GenerationResponse` objects token-by-token.
+Same as `generate` but yields `GenerationResponse` objects token-by-token.
 
-### `FlashSession(model_name, **kwargs)`
+### `Session(model_name, **kwargs)`
 
 Reusable session for multi-turn generation. Loads the model once, runs delta warmup automatically when prompts change domain.
 
 ```python
-session = FlashSession("mlx-community/Qwen3-Coder-Next-4bit",
-                       cache_dir="~/.cache/flash-moe")
+session = Session("mlx-community/Qwen3-Coder-Next-4bit",
+                       cache_dir="~/.cache/mlx-moe")
 session.stream(prompt, max_tokens=200)   # yields GenerationResponse
 session.generate(prompt, max_tokens=200) # returns str
 session.memory_gb                        # current GPU memory
@@ -222,7 +222,7 @@ For full control over the loading pipeline:
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from flash_moe.lazy_experts import (
+from mlx_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, get_fallback_stats
 )
 

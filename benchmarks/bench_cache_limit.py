@@ -8,7 +8,7 @@ import time
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from flash_moe.lazy_experts import (
+from mlx_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, fast_delta_warmup,
     get_fallback_stats,
 )
@@ -109,7 +109,7 @@ def main():
 
     # Write results to final_validation.md
     with open("PATH_REMOVED", "w") as f:
-        f.write("# Flash-MoE Final Validation Results\n\n")
+        f.write("# MLX-MoE Final Validation Results\n\n")
         f.write("## 1. mx.metal.set_cache_limit(0) Experiment\n\n")
         f.write("**Question:** Does clearing the MLX buffer cache before delta warmup reduce memory pressure and speed up scatter eval?\n\n")
         f.write("| Capacity | Cache Limit | Mem After Upgrade (GB) | Mem After Delta (GB) | Discovery (s) | Shard I/O (s) | Scatter (s) | Lookup/Eval (s) | Delta Total (s) | Gen (tok/s) | Fallback |\n")

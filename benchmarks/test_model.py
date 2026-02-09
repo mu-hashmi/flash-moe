@@ -1,4 +1,4 @@
-"""Test a single MoE model with flash-moe.
+"""Test a single MoE model with mlx-moe.
 
 Usage:
     uv run python benchmarks/test_model.py MODEL_NAME [--capacity N] [--baseline] [--tokens N]
@@ -24,7 +24,7 @@ TEST_PROMPTS = [
 
 
 def run_baseline(model_name, max_tokens=200):
-    """Run stock mlx-lm generation (no flash-moe) as baseline."""
+    """Run stock mlx-lm generation (no mlx-moe) as baseline."""
     import mlx_lm
 
     print(f"\n{'='*60}")
@@ -67,21 +67,21 @@ def run_baseline(model_name, max_tokens=200):
             "load_time": load_time, "gen_time": gen_time}
 
 
-def run_flash_moe(model_name, capacity=None, max_tokens=200):
-    """Run flash-moe generation with diagnostics."""
-    from flash_moe.lazy_experts.generate import _flash_startup
-    from flash_moe.lazy_experts.core import get_fallback_stats, measure_fallback
-    from flash_moe.lazy_experts.loading import _find_switch_mlp, _detect_num_experts
+def run_mlx_moe(model_name, capacity=None, max_tokens=200):
+    """Run mlx-moe generation with diagnostics."""
+    from mlx_moe.lazy_experts.generate import _startup
+    from mlx_moe.lazy_experts.core import get_fallback_stats, measure_fallback
+    from mlx_moe.lazy_experts.loading import _find_switch_mlp, _detect_num_experts
     import mlx_lm
 
     print(f"\n{'='*60}")
-    print(f"FLASH-MOE: {model_name} (capacity={capacity or 'auto'})")
+    print(f"MLX-MOE: {model_name} (capacity={capacity or 'auto'})")
     print(f"{'='*60}")
 
     prompt_text = TEST_PROMPTS[0]
 
     t0 = time.perf_counter()
-    model, tokenizer, model_path = _flash_startup(
+    model, tokenizer, model_path = _startup(
         model_name, prompt_text, capacity=capacity)
     startup_time = time.perf_counter() - t0
     mem_gb = mx.get_active_memory() / 1e9
@@ -160,7 +160,7 @@ def run_flash_moe(model_name, capacity=None, max_tokens=200):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test a MoE model with flash-moe")
+    parser = argparse.ArgumentParser(description="Test a MoE model with mlx-moe")
     parser.add_argument("model", help="HuggingFace model name")
     parser.add_argument("--capacity", "-c", type=int, default=None,
                         help="Expert capacity per layer (default: auto)")
@@ -175,11 +175,11 @@ def main():
     if args.baseline:
         baseline = run_baseline(args.model, max_tokens=args.tokens)
         all_results["baseline"] = baseline
-        # Need a fresh process for flash-moe after baseline since Metal buffers leak
-        print("\n[NOTE: For accurate flash-moe results after baseline, run in separate process]")
+        # Need a fresh process for mlx-moe after baseline since Metal buffers leak
+        print("\n[NOTE: For accurate mlx-moe results after baseline, run in separate process]")
 
-    flash = run_flash_moe(args.model, capacity=args.capacity, max_tokens=args.tokens)
-    all_results["flash_moe"] = flash
+    flash = run_mlx_moe(args.model, capacity=args.capacity, max_tokens=args.tokens)
+    all_results["mlx_moe"] = flash
 
     print(f"\n{'='*60}")
     print("SUMMARY")

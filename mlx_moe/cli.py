@@ -3,7 +3,7 @@ import sys
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="flash-moe")
+    parser = argparse.ArgumentParser(prog="mlx-moe")
     sub = parser.add_subparsers(dest="command")
 
     serve = sub.add_parser("serve", help="Start OpenAI/Anthropic-compatible API server")

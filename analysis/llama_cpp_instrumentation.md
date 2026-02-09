@@ -74,7 +74,7 @@ ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_exp
 cb(selected_experts, "ffn_moe_topk", il);
 
 // Add logging right after (for CPU execution):
-#ifdef FLASH_MOE_LOG_EXPERTS
+#ifdef MLX_MOE_LOG_EXPERTS
 {
     // Note: This only works for CPU execution
     // For GPU, you need to use the callback mechanism after graph execution
@@ -123,7 +123,7 @@ void log_expert_selections(const llama_context * ctx, int token_offset) {
 cd llama.cpp
 
 # Option 1: Use a build flag
-cmake -B build -DFLASH_MOE_LOG_EXPERTS=ON
+cmake -B build -DMLX_MOE_LOG_EXPERTS=ON
 cmake --build build
 
 # Option 2: Modify source and build normally

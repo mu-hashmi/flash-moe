@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Benchmark Metal residency and cache strategies for flash-moe.
+"""Benchmark Metal residency and cache strategies for mlx-moe.
 
 Tests the effect of mx.set_wired_limit() and refined cache_limit
 strategies on generation throughput and memory pressure cliff behavior.
@@ -19,7 +19,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from flash_moe.lazy_experts import (
+from mlx_moe.lazy_experts import (
     enable_lazy_experts,
     upgrade_from_profile,
     load_universal_profile,
@@ -32,7 +32,7 @@ from flash_moe.lazy_experts import (
 
 MODEL = "mlx-community/Qwen3-Coder-Next-4bit"
 PROMPT = "Write a Python function that implements binary search on a sorted array."
-PREPACKED_PATH = "/tmp/flash_moe_bench_residency.safetensors"
+PREPACKED_PATH = "/tmp/mlx_moe_bench_residency.safetensors"
 GEN_TOKENS = 200
 
 

@@ -1,5 +1,5 @@
 [project]
-name = "flash-moe"
+name = "mlx-moe"
 version = "0.1.0"
 description = "Run large MoE models on memory-constrained Macs via on-demand expert loading"
 readme = "README.md"
@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-flash-moe = "flash_moe.cli:main"
+mlx-moe = "mlx_moe.cli:main"
 
 [build-system]
 requires = ["hatchling"]

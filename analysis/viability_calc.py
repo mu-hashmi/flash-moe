@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end viability calculation for flash-moe.
+End-to-end viability calculation for mlx-moe.
 
 Combines measurements from:
 - madvise_bench.py (prefetch latency, lead time)
@@ -182,7 +182,7 @@ def calculate_viability(
 def print_viability_report(results: dict, bench: BenchmarkResults, model: ModelConfig):
     """Print formatted viability report."""
     print("\n" + "=" * 70)
-    print("FLASH-MOE VIABILITY CALCULATION")
+    print("MLX-MOE VIABILITY CALCULATION")
     print("=" * 70)
 
     print(f"\n--- Model: {model.name} ---")
@@ -293,7 +293,7 @@ def load_benchmark_results(results_dir: Path) -> BenchmarkResults:
 def interactive_mode():
     """Run interactive viability calculation with user inputs."""
     print("=" * 70)
-    print("FLASH-MOE VIABILITY CALCULATOR (Interactive)")
+    print("MLX-MOE VIABILITY CALCULATOR (Interactive)")
     print("=" * 70)
     print("\nEnter benchmark results (press Enter for defaults):\n")
 
@@ -332,7 +332,7 @@ def interactive_mode():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Calculate flash-moe viability")
+    parser = argparse.ArgumentParser(description="Calculate mlx-moe viability")
     parser.add_argument("--results-dir", type=Path, help="Directory with benchmark JSON files")
     parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
 

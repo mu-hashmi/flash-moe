@@ -2,13 +2,13 @@
 
 ## What This Project Is
 
-flash-moe enables large MoE models to run on memory-constrained Macs by loading only router-selected experts on demand from SSD. Runs a 46GB model on a 32GB Mac at 6-23 tok/s using 19 GB.
+mlx-moe enables large MoE models to run on memory-constrained Macs by loading only router-selected experts on demand from SSD. Runs a 46GB model on a 32GB Mac at 6-23 tok/s using 19 GB.
 
 ## Project Structure
 
 ```
-flash_moe/                  # The package (pip-installable)
-  __init__.py               # Exports: flash_generate, flash_stream_generate, FlashSession
+mlx_moe/                  # The package (pip-installable)
+  __init__.py               # Exports: generate, stream_generate, Session
   lazy_experts/             # Core implementation
     core.py                 # enable/upgrade/reset, cache stats, dynamic refresh
     modules.py              # ExpertCache, Lazy/Cached/Predictive module classes
@@ -16,9 +16,9 @@ flash_moe/                  # The package (pip-installable)
     discovery.py            # Router-only discovery, speculative probes
     warmup.py               # Delta warmup, incremental warmup
     persistence.py          # Cache state save/load, prepacked weights, profiles
-    generate.py             # flash_generate, flash_stream_generate, FlashSession
+    generate.py             # generate, stream_generate, Session
 
-  cli.py                    # CLI entry point: flash-moe serve
+  cli.py                    # CLI entry point: mlx-moe serve
   server.py                 # OpenAI + Anthropic API server (Starlette + uvicorn)
 
 benchmarks/                 # Profiling and benchmark scripts
@@ -34,7 +34,7 @@ This is a uv project. Python 3.13.
 
 ```bash
 uv sync
-uv run python -c "from flash_moe import flash_generate; print('ok')"
+uv run python -c "from mlx_moe import generate; print('ok')"
 ```
 
 ## Running Benchmarks
@@ -83,10 +83,10 @@ Any MLX model using `SwitchGLU` with either module path:
 - **MLX is NOT thread-safe** for GPU eval — cooperative single-thread only
 - Per-call `mx.load()` in warmup is intentional — fancy indexing materializes full source tensors, so fresh lazy refs each call prevents OOM
 
-## API Server (`flash-moe serve`)
+## API Server (`mlx-moe serve`)
 
 ```bash
-flash-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH] [--max-tokens N] [--max-input-tokens N]
+mlx-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH] [--max-tokens N] [--max-input-tokens N]
 ```
 
 Endpoints: `/v1/chat/completions` (OpenAI), `/v1/messages` (Anthropic), `/v1/models`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Benchmark warmup optimizations for flash-moe.
+"""Benchmark warmup optimizations for mlx-moe.
 
 Usage:
     PATH_REMOVED benchmarks/bench_warmup.py [profile_path] [capacity]
@@ -17,7 +17,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.utils import hf_repo_to_path
-from flash_moe.lazy_experts import (
+from mlx_moe.lazy_experts import (
     enable_lazy_experts,
     upgrade_to_predictive,
     upgrade_to_predictive_with_pinning,
@@ -36,8 +36,8 @@ from flash_moe.lazy_experts import (
 MODEL = "mlx-community/Qwen3-Coder-Next-4bit"
 WARMUP_TOKENS = 10
 PROMPT = "Write a Python function that implements binary search on a sorted array."
-PREPACKED_PATH = "/tmp/flash_moe_bench_prepacked.safetensors"
-CACHE_PATH = "/tmp/flash_moe_bench_cache.json"
+PREPACKED_PATH = "/tmp/mlx_moe_bench_prepacked.safetensors"
+CACHE_PATH = "/tmp/mlx_moe_bench_cache.json"
 
 
 def cleanup_temp_files(*paths):

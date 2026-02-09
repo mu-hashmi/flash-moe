@@ -335,30 +335,23 @@ def _load_experts(key_prefix: str, expert_ids, shard=None,
     return _load_proj_experts(shard, key_prefix, expert_ids, shard_map=shard_map)
 
 
-def select_capacity(target_model_memory_gb: float, system_memory_gb: float,
+def select_capacity(base_memory_gb: float, recommended_gb: float,
                     num_moe_layers: int = 48,
-                    expert_slot_mb: float = 1.69) -> int:
+                    expert_slot_mb: float = 1.77) -> int:
     """Select expert cache capacity to stay under the Metal memory pressure cliff.
 
-    Uses a 56% of system RAM heuristic for the Metal headroom budget, then
-    divides available space by per-slot expert memory.
+    Takes max_recommended_working_set_size from Metal (not total system RAM) and
+    targets 71% of it. The pressure cliff on Apple Silicon starts at ~75% of the
+    recommended limit; 71% leaves headroom for KV cache growth during generation.
 
-    Args:
-        target_model_memory_gb: Size of non-expert model weights in GB.
-        system_memory_gb: Total device memory in GB.
-        num_moe_layers: Number of MoE layers in the model.
-        expert_slot_mb: Memory per expert slot per layer in MB.
-
-    Returns:
-        Optimal capacity per layer (multiple of 8, clamped to 0..512).
+    expert_slot_mb should include weight + scales + biases (all quantization
+    metadata), not just the weight tensor.
     """
-    # Apple Silicon reports ~34 GB for a "32 GB" Mac (unified memory includes
-    # system overhead). 0.53 accounts for this to stay at cap 208 on 32 GB.
-    budget_gb = system_memory_gb * 0.53 - target_model_memory_gb
-    expert_memory_per_slot_gb = num_moe_layers * expert_slot_mb / 1024
-    if expert_memory_per_slot_gb <= 0:
+    target_gb = recommended_gb * 0.71
+    slot_gb = num_moe_layers * expert_slot_mb / 1024
+    if slot_gb <= 0:
         return 0
-    capacity = int(budget_gb / expert_memory_per_slot_gb)
+    capacity = int((target_gb - base_memory_gb) / slot_gb)
     if capacity >= 16:
         capacity = (capacity // 8) * 8
     return max(0, min(512, capacity))

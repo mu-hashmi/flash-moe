@@ -5,19 +5,19 @@ dequantize → requantize through MLX lazy evaluation. No fp16 intermediate
 files — peak RAM is ~one shard eval at a time (~5 GB).
 
 Usage:
-    uv run python -m flash_moe.convert_2bit \
+    uv run python -m mlx_moe.convert_2bit \
         mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit \
         --output ~/models/Mixtral-8x22B-Instruct-v0.1-2bit \
         --expert-bits 2 --base-bits 4
 
     # Uniform 2-bit (all layers):
-    uv run python -m flash_moe.convert_2bit \
+    uv run python -m mlx_moe.convert_2bit \
         mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit \
         --output ~/models/Mixtral-8x22B-Instruct-v0.1-2bit \
         --expert-bits 2 --base-bits 2
 
     # Dry run (shows what would change, no disk writes):
-    uv run python -m flash_moe.convert_2bit \
+    uv run python -m mlx_moe.convert_2bit \
         mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit \
         --dry-run
 """
