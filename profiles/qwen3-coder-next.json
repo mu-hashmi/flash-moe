@@ -1,7 +1,10 @@
 {
+  "model": "mlx-community/Qwen3-Coder-Next-4bit",
   "num_prompts": 22,
   "threshold": 0.5,
   "capacity": 208,
+  "num_experts": 512,
+  "moe_layers": 48,
   "layers": {
     "0": {
       "universal": [

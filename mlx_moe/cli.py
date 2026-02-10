@@ -19,6 +19,9 @@ def main():
                        help="Max input tokens — rejects requests over this (default: 16384)")
     serve.add_argument("--kv-bits", type=int, default=None,
                        help="Quantize KV cache to N bits (8 recommended). Saves ~45%% KV memory.")
+    serve.add_argument("--warmup", choices=["hybrid", "full", "none"], default="hybrid",
+                       help="Warmup strategy: hybrid (default, profile + real generation), "
+                            "full (Phase 2 LCP, ~90s, 0%% fallback), none (profile/discovery only)")
 
     args = parser.parse_args()
 
@@ -33,6 +36,7 @@ def main():
             max_tokens=args.max_tokens,
             max_input_tokens=args.max_input_tokens,
             kv_bits=args.kv_bits,
+            warmup=args.warmup,
         )
     else:
         parser.print_help()

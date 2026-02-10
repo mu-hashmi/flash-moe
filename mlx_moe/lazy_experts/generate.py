@@ -32,8 +32,14 @@ _WARMUP_CACHE = 256 * 1024 * 1024
 
 
 def _startup(model_name, prompt, cache_dir=None, profile_path=None,
-                   prepacked=True, capacity=None):
+                   prepacked=True, capacity=None, warmup="hybrid"):
     """Shared startup for generate and stream_generate.
+
+    Args:
+        warmup: "hybrid" (default) — profile/discovery + short real generation to
+            refine expert cache. "full" — Phase 2 LCP warmup with actual expert
+            loading (~90s, 0% fallback). "none" — profile/discovery only, no
+            refinement.
 
     Returns (model, tokenizer, model_path) with all warmup/upgrade/wiring done.
     """
@@ -146,7 +152,15 @@ def _startup(model_name, prompt, cache_dir=None, profile_path=None,
         used_saved_state = True
 
     else:
-        if profile_path is not None:
+        if warmup == "full":
+            t0 = time.perf_counter()
+            _mlx_lm.generate(model, tokenizer, prompt=prompt,
+                             max_tokens=50, verbose=False)
+            with _with_cache_limit_zero(_WARMUP_CACHE):
+                upgrade_to_predictive(model, model_path, capacity,
+                                      st_map=model._st_map)
+            print(f"  Full LCP warmup + upgrade: {time.perf_counter() - t0:.1f}s")
+        elif profile_path is not None:
             t0 = time.perf_counter()
             profile = load_universal_profile(profile_path)
             with _with_cache_limit_zero(_WARMUP_CACHE):
@@ -158,6 +172,19 @@ def _startup(model_name, prompt, cache_dir=None, profile_path=None,
                 router_only_discovery(model, tokenizer, prompt, max_tokens=10)
                 upgrade_to_predictive(model, model_path, capacity)
             print(f"  Router-only discovery + upgrade: {time.perf_counter() - t0:.1f}s")
+
+        if warmup == "hybrid" and not used_saved_state:
+            from .core import dynamic_cache_update, enable_skip_fallback
+            enable_skip_fallback(model)
+            t0 = time.perf_counter()
+            for resp in _mlx_lm.stream_generate(model, tokenizer, prompt=prompt,
+                                                 max_tokens=10):
+                dynamic_cache_update(model, max_layer_updates=48)
+            swaps = sum(
+                s.get("swaps", 0)
+                for s in dynamic_cache_update(model, max_layer_updates=48)
+            )
+            print(f"  Hybrid warmup: {time.perf_counter() - t0:.1f}s ({swaps} expert swaps)")
 
     peak_gb = mx.get_peak_memory() / 1e9
     if peak_gb > gc_limit_gb:
@@ -174,7 +201,8 @@ def _startup(model_name, prompt, cache_dir=None, profile_path=None,
         print(f"  Save prepacked: {time.perf_counter() - t0:.1f}s")
 
     from .core import enable_skip_fallback
-    enable_skip_fallback(model)
+    if warmup != "hybrid" or used_saved_state:
+        enable_skip_fallback(model)
 
     t_total = time.perf_counter() - t_total_start
     print(f"  Total startup: {t_total:.1f}s")
@@ -194,7 +222,8 @@ def generate(model_name: str, prompt: str, max_tokens: int = 200,
                    profile_path: str | None = None,
                    prepacked: bool = True,
                    capacity: int | None = None,
-                   kv_bits: int | None = None) -> str:
+                   kv_bits: int | None = None,
+                   warmup: str = "hybrid") -> str:
     """One-call generation with all optimizations.
 
     Args:
@@ -207,6 +236,7 @@ def generate(model_name: str, prompt: str, max_tokens: int = 200,
         capacity: Experts per layer. None = auto-select based on available RAM.
         kv_bits: Quantize KV cache to this many bits (8 recommended). Saves ~45%
             KV memory at 8-bit. None = fp16 (default).
+        warmup: "hybrid" (default), "full", or "none".
 
     Returns:
         Generated text string.
@@ -215,7 +245,8 @@ def generate(model_name: str, prompt: str, max_tokens: int = 200,
 
     model, tokenizer, _ = _startup(
         model_name, prompt, cache_dir=cache_dir,
-        profile_path=profile_path, prepacked=prepacked, capacity=capacity)
+        profile_path=profile_path, prepacked=prepacked, capacity=capacity,
+        warmup=warmup)
 
     kv_kwargs = {}
     if kv_bits is not None:
@@ -230,7 +261,8 @@ def stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
                           profile_path: str | None = None,
                           prepacked: bool = True,
                           capacity: int | None = None,
-                          kv_bits: int | None = None):
+                          kv_bits: int | None = None,
+                          warmup: str = "hybrid"):
     """Streaming variant of generate.
 
     Startup is blocking. After startup, yields GenerationResponse objects
@@ -243,7 +275,8 @@ def stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
 
     model, tokenizer, _ = _startup(
         model_name, prompt, cache_dir=cache_dir,
-        profile_path=profile_path, prepacked=prepacked, capacity=capacity)
+        profile_path=profile_path, prepacked=prepacked, capacity=capacity,
+        warmup=warmup)
 
     kv_kwargs = {}
     if kv_bits is not None:

@@ -427,6 +427,7 @@ class PredictiveCachedSwitchLinear(nn.Module):
         if self._proj_name == "up_proj":
             self._cache._indices_buffer.append(indices)
         local_indices = self._cache.remap(indices)
+        # Remap breaks sorted order — always pass sorted_indices=False
         return mx.gather_qmm(
             x,
             self._cache.weights[self._proj_name],
@@ -437,7 +438,6 @@ class PredictiveCachedSwitchLinear(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
-            sorted_indices=sorted_indices,
         )
 
 
@@ -464,6 +464,7 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
             self._cache._indices_buffer.append(indices)
         mx.eval(indices)
         local_indices = self._cache.remap(indices)
+        # Remap breaks sorted order — always pass sorted_indices=False
         return mx.gather_qmm(
             x,
             self._cache.weights[self._proj_name],
@@ -474,7 +475,6 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
-            sorted_indices=sorted_indices,
         )
 
 

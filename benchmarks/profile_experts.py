@@ -35,7 +35,7 @@ MODEL_PRESETS = {
 
 WARMUP_TOKENS = 10
 
-PROMPTS = [
+PROMPTS_DIVERSE = [
     "Explain general relativity in simple terms",
     "What caused World War I?",
     "Write an A* pathfinding implementation in Python",
@@ -59,6 +59,44 @@ PROMPTS = [
     "Write a matrix multiplication in NumPy",
     "Explain how transformers work in NLP",
 ]
+
+PROMPTS_CODING = [
+    # Python
+    "Write a Python function that implements binary search on a sorted array",
+    "Implement a Python class for a thread-safe LRU cache with TTL expiration",
+    "Write a Python async HTTP client with retry logic and exponential backoff",
+    "Debug this Python code: def fib(n): return fib(n-1) + fib(n-2)",
+    "Refactor this function to use dataclasses instead of dicts for configuration",
+    # JavaScript/TypeScript
+    "Implement a React hook for debounced search with AbortController",
+    "Write a TypeScript generic type that extracts all nested keys from an object",
+    "Build a simple Express.js middleware for rate limiting with sliding window",
+    # Rust/Go/C
+    "Implement a concurrent hashmap in Rust using RwLock and sharding",
+    "Write a Go HTTP server with graceful shutdown and context cancellation",
+    "Write a recursive descent parser for arithmetic expressions in C",
+    # Systems / Architecture
+    "Design a URL shortener system with Redis caching and PostgreSQL storage",
+    "Write a Dockerfile for a Python FastAPI app with multi-stage build",
+    "Implement a simple key-value store with write-ahead logging",
+    # Tool use / Agentic patterns (Claude Code scenario)
+    'You have access to tools: [{"name": "read_file", "parameters": {"path": "string"}}]. Read the file at src/main.py and explain what it does.',
+    'Based on the error "TypeError: Cannot read property map of undefined", fix the React component that fetches user data.',
+    'Generate a JSON schema for a REST API endpoint that creates a new user with name, email, and role fields.',
+    "Write a bash script that finds all Python files with syntax errors in a directory",
+    # Code review / explanation
+    "Explain what this code does: async def stream(): async for chunk in response.aiter_bytes(): yield chunk",
+    "What are the performance implications of using SELECT * vs named columns in PostgreSQL?",
+    "Compare the tradeoffs between WebSockets and Server-Sent Events for real-time updates",
+    "Write unit tests for a function that parses ISO 8601 date strings with timezone handling",
+]
+
+PROMPT_PRESETS = {
+    "diverse": PROMPTS_DIVERSE,
+    "coding": PROMPTS_CODING,
+}
+
+PROMPTS = PROMPTS_DIVERSE
 
 
 def apply_chat_template(tokenizer, text):
@@ -124,7 +162,13 @@ def main():
                         help="Fraction of prompts for 'universal' classification (default: 0.5)")
     parser.add_argument("--output", "-o", default=None,
                         help="Output JSON path (default: <model>_experts.json)")
+    parser.add_argument("--prompts", "-p", choices=list(PROMPT_PRESETS.keys()),
+                        default=None, help="Prompt preset (default: diverse)")
     args = parser.parse_args()
+
+    if args.prompts:
+        global PROMPTS
+        PROMPTS = PROMPT_PRESETS[args.prompts]
 
     if args.model in MODEL_PRESETS:
         model_name, default_capacity = MODEL_PRESETS[args.model]

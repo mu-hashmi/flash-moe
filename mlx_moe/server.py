@@ -15,7 +15,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from .lazy_experts.generate import Session
+import mlx.core as mx
 
 import sys
 if not sys.stdout.isatty():
@@ -151,7 +151,8 @@ class Server:
                  profile_path: str | None = None,
                  max_tokens: int = MAX_TOKENS_CAP,
                  max_input_tokens: int = MAX_INPUT_TOKENS,
-                 kv_bits: int | None = None):
+                 kv_bits: int | None = None,
+                 warmup: str = "hybrid"):
         self._model_name = model_name
         self._capacity = capacity
         self._profile_path = profile_path or _find_profile(model_name)
@@ -162,29 +163,63 @@ class Server:
         self._max_tokens = max_tokens
         self._max_input_tokens = max_input_tokens
         self._kv_bits = kv_bits
+        self._warmup = warmup
 
     def load(self):
-        session = Session(
-            self._model_name,
+        from .lazy_experts.generate import _startup
+        # Startup without hybrid warmup — defer to first real request
+        model, tokenizer, _ = _startup(
+            self._model_name, "Hello",
             cache_dir=str(Path.home() / ".cache" / "mlx-moe"),
             profile_path=self._profile_path,
             capacity=self._capacity,
+            warmup="none",
         )
-        session._ensure_loaded("Hello")
-        self._model = session._model
-        self._tokenizer = session._tokenizer
-        self._memory_gb = session.memory_gb
+        self._model = model
+        self._tokenizer = tokenizer
+        self._memory_gb = mx.get_active_memory() / 1e9
+        self._needs_warmup = self._warmup == "hybrid"
+
+    def _warmup_on_first_request(self, prompt: str):
+        """Run hybrid warmup — short prompt to avoid prefilling the user's full context."""
+        import mlx_lm as _mlx_lm
+        from .lazy_experts.core import dynamic_cache_update
+        import time
+        # Use a short coding-relevant prompt, not the user's 14K token context
+        warmup_prompt = "Write a Python function that implements binary search on a sorted array."
+        if self._tokenizer.has_chat_template:
+            warmup_prompt = self._tokenizer.apply_chat_template(
+                [{"role": "user", "content": warmup_prompt}],
+                add_generation_prompt=True, tokenize=False)
+        t0 = time.perf_counter()
+        for resp in _mlx_lm.stream_generate(self._model, self._tokenizer,
+                                             prompt=warmup_prompt, max_tokens=10):
+            dynamic_cache_update(self._model, max_layer_updates=48)
+        swaps = sum(s.get("swaps", 0)
+                    for s in dynamic_cache_update(self._model, max_layer_updates=48))
+        print(f"  Hybrid warmup: {time.perf_counter() - t0:.1f}s "
+              f"({swaps} expert swaps)")
 
     def _stream(self, prompt: str, max_tokens: int, **sampling):
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
+        from .lazy_experts.core import dynamic_cache_update
+        if self._needs_warmup:
+            self._warmup_on_first_request(prompt)
+            self._needs_warmup = False
         kv_kwargs = {}
         if self._kv_bits is not None:
             kv_kwargs = dict(kv_bits=self._kv_bits, kv_group_size=64, quantized_kv_start=0)
-        yield from _mlx_lm.stream_generate(
+        for resp in _mlx_lm.stream_generate(
             self._model, self._tokenizer, prompt=prompt, max_tokens=max_tokens,
             sampler=make_sampler(**sampling), **kv_kwargs,
-        )
+        ):
+            yield resp
+            t = resp.generation_tokens
+            if t <= 10:
+                dynamic_cache_update(self._model, max_layer_updates=48)
+            elif t <= 30 and t % 3 == 0:
+                dynamic_cache_update(self._model, max_layer_updates=24)
 
     def _tokenize_messages(self, messages: list, tools: list | None = None) -> str:
         tokenizer = self._tokenizer
@@ -240,7 +275,7 @@ class Server:
         if err := self._check_input_length(input_tokens):
             return err
 
-        print(f"  [openai] max_tokens={max_tokens} stream={stream} input_tokens={input_tokens}")
+        print(f"  [openai] max_tokens={max_tokens} stream={stream} tools={len(tools) if tools else 0} input_tokens={input_tokens}")
 
         if stream:
             return StreamingResponse(
@@ -567,13 +602,14 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                capacity: int | None = None, profile_path: str | None = None,
                max_tokens: int = MAX_TOKENS_CAP,
                max_input_tokens: int = MAX_INPUT_TOKENS,
-               kv_bits: int | None = None):
+               kv_bits: int | None = None,
+               warmup: str = "hybrid"):
     import uvicorn
     from contextlib import asynccontextmanager
 
     server = Server(model_name, capacity=capacity, profile_path=profile_path,
                     max_tokens=max_tokens, max_input_tokens=max_input_tokens,
-                    kv_bits=kv_bits)
+                    kv_bits=kv_bits, warmup=warmup)
 
     print(f"mlx-moe serve")
     print(f"  Model:    {model_name}")

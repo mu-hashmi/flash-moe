@@ -831,9 +831,11 @@ def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
         else:
             gates = self.gate(x)
             k = getattr(self, "num_experts_per_tok", getattr(self, "top_k", 2))
+            gates = mx.softmax(gates, axis=-1, precise=True)
             inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
             scores = mx.take_along_axis(gates, inds, axis=-1)
-            scores = mx.softmax(scores, axis=-1, precise=True)
+            if getattr(self, "norm_topk_prob", False):
+                scores = scores / scores.sum(axis=-1, keepdims=True)
 
         mask = cache.hit_mask[inds]
         scores = scores * mask
