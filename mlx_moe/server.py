@@ -164,6 +164,8 @@ class Server:
         self._max_input_tokens = max_input_tokens
         self._kv_bits = kv_bits
         self._warmup = warmup
+        self._cached_tokens = None
+        self._cached_kv = None
 
     def load(self):
         from .lazy_experts.generate import _startup
@@ -203,23 +205,65 @@ class Server:
     def _stream(self, prompt: str, max_tokens: int, **sampling):
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
+        from mlx_lm.models import cache as cache_module
         from .lazy_experts.core import dynamic_cache_update
         if self._needs_warmup:
             self._warmup_on_first_request(prompt)
             self._needs_warmup = False
+
+        # Tokenize prompt (matching stream_generate's logic for consistent token IDs)
+        tokenizer = self._tokenizer
+        add_special = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=add_special)
+
+        # Find longest common prefix with cached KV from previous request
+        prompt_cache = None
+        prefix_len = 0
+        if self._cached_tokens is not None:
+            cached = self._cached_tokens
+            min_len = min(len(cached), len(prompt_tokens))
+            while prefix_len < min_len and cached[prefix_len] == prompt_tokens[prefix_len]:
+                prefix_len += 1
+
+        if prefix_len > 0:
+            # generate_step requires at least 1 input token
+            if prefix_len >= len(prompt_tokens):
+                prefix_len = len(prompt_tokens) - 1
+            trim_amount = len(self._cached_tokens) - prefix_len
+            if trim_amount > 0:
+                cache_module.trim_prompt_cache(self._cached_kv, trim_amount)
+            prompt_cache = self._cached_kv
+            suffix = prompt_tokens[prefix_len:]
+            print(f"  [kv cache: reusing {prefix_len}, processing {len(suffix)} new tokens]")
+        else:
+            suffix = prompt_tokens
+            prompt_cache = cache_module.make_prompt_cache(self._model)
+
+        # Invalidate cache before generation — restored on successful completion
+        self._cached_tokens = None
+        self._cached_kv = None
+
         kv_kwargs = {}
         if self._kv_bits is not None:
             kv_kwargs = dict(kv_bits=self._kv_bits, kv_group_size=64, quantized_kv_start=0)
+
+        generated_tokens = []
         for resp in _mlx_lm.stream_generate(
-            self._model, self._tokenizer, prompt=prompt, max_tokens=max_tokens,
-            sampler=make_sampler(**sampling), **kv_kwargs,
+            self._model, tokenizer, prompt=mx.array(suffix),
+            max_tokens=max_tokens, sampler=make_sampler(**sampling),
+            prompt_cache=prompt_cache, **kv_kwargs,
         ):
+            generated_tokens.append(resp.token)
             yield resp
             t = resp.generation_tokens
             if t <= 10:
                 dynamic_cache_update(self._model, max_layer_updates=48)
             elif t <= 30 and t % 3 == 0:
                 dynamic_cache_update(self._model, max_layer_updates=24)
+
+        # Save KV cache + token sequence for next request's prefix matching
+        self._cached_tokens = prompt_tokens + generated_tokens
+        self._cached_kv = prompt_cache
 
     def _tokenize_messages(self, messages: list, tools: list | None = None) -> str:
         tokenizer = self._tokenizer
