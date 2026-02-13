@@ -15,12 +15,14 @@ Load Model (lazy)  →  Router Discovery  →  Expert Selection  →  Predictive
 
 ## Stage 1: Lazy Loading
 
-`enable_lazy_experts(model, model_path, capacity, predictive=True)` walks the model tree, finds every `QuantizedSwitchLinear` module (the expert projection layers inside SwitchGLU blocks), and replaces them with `CachedQuantizedSwitchLinear`. Two module path conventions are detected:
+`enable_lazy_experts(model, model_path, capacity, predictive=True)` walks the model tree, finds every `QuantizedSwitchLinear` module (the expert projection layers inside SwitchGLU blocks), and replaces them with lazy-loading versions. The full replacement chain across stages is: `QuantizedSwitchLinear` (stock mlx-lm) → `LazyQuantizedSwitchLinear` (lazy disk loading) → `CachedQuantizedSwitchLinear` (LRU cache) → `PredictiveCachedSwitchLinear` (pre-stacked, zero-eval dispatch). Two module path conventions are detected:
 
 - `layer.mlp.switch_mlp` -- Qwen, DeepSeek, GLM, Hunyuan, Jamba, OLMoE
 - `layer.block_sparse_moe.switch_mlp` -- Mixtral, PhiMoE, MiniMax, GraniteMoE
 
 After replacement, `mx.eval(model.parameters())` materializes only non-expert weights (~1.4 GB for a 46 GB model). Expert weights remain as lazy references in safetensors files on disk.
+
+Each MoE layer's SwitchGLU contains 3 projection modules (gate_proj, up_proj, down_proj) — each is a separate `QuantizedSwitchLinear` holding all 512 experts. The SwitchGLU also has a **shared expert** (a standard MLP, always active on every token, never offloaded). The shared expert is critical for quality at low capacity — it provides a baseline MLP contribution even when routed experts are missing.
 
 Each `CachedQuantizedSwitchLinear` shares a per-layer `ExpertCache` (LCP eviction: priority = frequency * 0.25^(recency/128)). During warmup, cache misses batch-load experts from the safetensors shard, eval once, then insert into the cache.
 
@@ -68,9 +70,22 @@ This keeps the entire forward pass in MLX's lazy evaluation graph, evaluated onl
 
 **Per-call `mx.load()` during warmup.** Fancy indexing on a lazy-loaded tensor materializes the *entire source tensor* permanently in Metal memory. Fresh `mx.load()` calls per batch give the GC a chance to free the source after slicing.
 
-**Wired memory via `mx.set_wired_limit()`.** Pins the working set in a Metal residency set, preventing the OS from paging out expert weights under memory pressure. Provides +21% tok/s at capacity 208.
+**Wired memory via `mx.set_wired_limit()`.** Pins the working set in a Metal `MTLResidencySet`, preventing macOS from evicting Metal buffers to SSD when total memory exceeds `recommendedMaxWorkingSetSize` (~75% of RAM). Wiring alone provides +21% tok/s; combined with `cache_limit(256MB)` during warmup (retains buffer cache for intermediate reuse), the total improvement is +47% (15.9 → 23.4 tok/s at capacity 208).
 
 **mmap expert loading.** `SafetensorsMap` parses safetensors headers at init and mmaps each shard. `get_expert_slices()` computes byte offsets for each expert's row and reads only those bytes, avoiding materializing the full stacked tensor. 3.1x faster than `mx.load` for top-2 loading (crossover at 5-6 experts).
+
+## Server: Prompt Caching (KV Cache Reuse)
+
+The API server (`server.py`) caches the KV state (`_cached_tokens` + `_cached_kv`) from the previous request. On each new request, `_stream()` tokenizes the prompt and finds the longest common prefix (token-by-token comparison) with the cached sequence. It trims the KV cache to the prefix length and only prefills the new suffix tokens. For multi-turn agentic conversations where successive requests share a long prefix (system prompt + tools + full conversation history), this reduces TTFT from processing the full prompt to processing only the new user/tool message.
+
+The cached sequence includes the model's generated tokens — so the prefix match extends through the model's previous response, not just the previous prompt. The cache is invalidated before generation starts and restored on successful completion; a client disconnect mid-stream loses the cache.
+
+## Server: Hybrid Warmup
+
+On the first request, the server generates 10 tokens from a short coding prompt. This serves two purposes:
+
+1. **Expert coverage confirmation**: `dynamic_cache_update` runs between tokens and swaps in any experts the profile missed for the prompt's domain.
+2. **One-time cost front-loading**: the first forward pass pays for Metal shader compilation and faulting mmap'd prepacked weights into physical memory. Without warmup, these costs shift to the user's first real request.
 
 ## Memory Layout
 

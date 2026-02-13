@@ -1,4 +1,4 @@
-# mlx-moe
+# MLX-MoE
 
 Run large Mixture-of-Experts models on memory-constrained Macs by loading only router-selected experts on demand from SSD. A 46 GB Qwen3-Coder-Next model runs on a 32 GB Mac at 6-23 tok/s using 19 GB, with coherent output through 1000+ tokens.
 
@@ -35,6 +35,7 @@ ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_API_KEY=mlx-moe <your-client>
 ```
 
 Endpoints:
+
 - `POST /v1/chat/completions` — OpenAI chat completions (streaming and non-streaming)
 - `POST /v1/messages` — Anthropic Messages API (SSE streaming)
 - `GET /v1/models` — model discovery
@@ -80,9 +81,9 @@ First launch downloads the model (~24 GB) and warms up experts (~13s). Subsequen
 
 ## Supported Models
 
-| Model | Experts | Top-K | MoE Layers | Full Size | mlx-moe Memory | tok/s |
-|-------|--------:|------:|-----------:|---------:|-----------------:|------:|
-| [Qwen3-Coder-Next-4bit](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit) | 512 | 10 | 48 | 46 GB (OOM) | **19.1 GB** | 23 |
+| Model                                                                               | Experts | Top-K | MoE Layers |   Full Size | mlx-moe Memory | tok/s |
+| ----------------------------------------------------------------------------------- | ------: | ----: | ---------: | ----------: | -------------: | ----: |
+| [Qwen3-Coder-Next-4bit](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit) |     512 |    10 |         48 | 46 GB (OOM) |    **19.1 GB** |    23 |
 
 Any MLX model using `SwitchGLU` is supported — covers Qwen, Mixtral, GLM, DeepSeek, Hunyuan, PhiMoE, Jamba, OLMoE, MiniMax, and GraniteMoE families. Both stacked and per-expert safetensors formats are handled automatically. Models with complex gates (e.g. GLM's `MoEGate`) are also supported.
 
@@ -94,26 +95,26 @@ mlx-moe is valuable when a model **exceeds your Mac's RAM** and has favorable Mo
 2. **Shared expert** — provides a quality floor when routed experts miss
 3. **Concentrated routing** — a small set of "universal" experts handles most tokens; the long tail stays on SSD
 
-| Model | Ratio | Shared Expert | Routing | Verdict |
-|-------|------:|:---:|:---:|:---|
-| Qwen3-Coder-Next (512 exp) | 51x | Yes | 15% universal | **Works at 40% coverage, 0% fallback** |
-| Qwen3-Coder-480B (512 exp) | 51x | Yes | Same arch | **Primary target** — same arch, ~200 GB |
-| Qwen3-235B (128 exp) | 16x | Yes | Same arch | Good target — ~130 GB |
-| GLM-4.7-Flash (64 exp) | 16x | Yes | 44% universal | Works, but fits on 32 GB natively |
-| Qwen3-30B-A3B (128 exp) | 16x | No | 14% universal | Needs ~75% coverage — fits natively |
-| Qwen2-MoE-57B (64 exp) | 8x | Yes | 95% universal | All experts needed — quality degrades |
-| Mixtral-8x7B (8 exp) | 4x | No | 100% universal | Ratio too low |
+| Model                      | Ratio | Shared Expert |    Routing     | Verdict                                 |
+| -------------------------- | ----: | :-----------: | :------------: | :-------------------------------------- |
+| Qwen3-Coder-Next (512 exp) |   51x |      Yes      | 15% universal  | **Works at 40% coverage, 0% fallback**  |
+| Qwen3-Coder-480B (512 exp) |   51x |      Yes      |   Same arch    | **Primary target** — same arch, ~200 GB |
+| Qwen3-235B (128 exp)       |   16x |      Yes      |   Same arch    | Good target — ~130 GB                   |
+| GLM-4.7-Flash (64 exp)     |   16x |      Yes      | 44% universal  | Works, but fits on 32 GB natively       |
+| Qwen3-30B-A3B (128 exp)    |   16x |      No       | 14% universal  | Needs ~75% coverage — fits natively     |
+| Qwen2-MoE-57B (64 exp)     |    8x |      Yes      | 95% universal  | All experts needed — quality degrades   |
+| Mixtral-8x7B (8 exp)       |    4x |      No       | 100% universal | Ratio too low                           |
 
 Models without a shared expert collapse to garbage below ~75% expert coverage. Models with uniform routing can't benefit from selective caching. The sweet spot is high ratio + shared expert + concentrated routing.
 
 ## Hardware Requirements
 
-| System RAM | Capacity | Memory | tok/s | Notes |
-|-----------:|---------:|-------:|------:|-------|
-| 32 GB | 208 | 19 GB | 8-23 | Recommended |
-| 48 GB | 320 | ~28 GB | 15-25 | Estimated |
-| 64 GB | 432 | ~37 GB | 20-30 | Estimated |
-| 128 GB | 512 | ~44 GB | 30-40 | Full expert coverage |
+| System RAM | Capacity | Memory | tok/s | Notes                |
+| ---------: | -------: | -----: | ----: | -------------------- |
+|      32 GB |      208 |  19 GB |  8-23 | Recommended          |
+|      48 GB |      320 | ~28 GB | 15-25 | Estimated            |
+|      64 GB |      432 | ~37 GB | 20-30 | Estimated            |
+|     128 GB |      512 | ~44 GB | 30-40 | Full expert coverage |
 
 "Capacity" = experts cached per MoE layer. Auto-selected based on available RAM.
 
@@ -143,21 +144,21 @@ uv run python benchmarks/profile_experts.py --model mlx-community/Some-MoE-Model
 
 ### Qwen3-Coder-Next-4bit on 32 GB Mac
 
-| Config | tok/s | Repetition @ 1000 tokens |
-|--------|------:|-------------------------:|
-| Baseline | 8.8 | 0.20 (degrades at ~250) |
-| + Pinning | 8.7 | 0.03 |
-| + Wired limit | 10.6 | 0.03 |
-| + All optimizations (burst) | ~23 | 0.03 |
+| Config                      | tok/s | Repetition @ 1000 tokens |
+| --------------------------- | ----: | -----------------------: |
+| Baseline                    |   8.8 |  0.20 (degrades at ~250) |
+| + Pinning                   |   8.7 |                     0.03 |
+| + Wired limit               |  10.6 |                     0.03 |
+| + All optimizations (burst) |   ~23 |                     0.03 |
 
 ### Startup Times
 
-| Scenario | Time |
-|----------|-----:|
-| Warm start (prepacked weights exist) | ~6s |
-| Cold start (with profile) | ~13s |
-| Cold start (no profile, router discovery) | ~17s |
-| Domain switch (delta warmup) | ~2-3s |
+| Scenario                                  |  Time |
+| ----------------------------------------- | ----: |
+| Warm start (prepacked weights exist)      |   ~6s |
+| Cold start (with profile)                 |  ~13s |
+| Cold start (no profile, router discovery) |  ~17s |
+| Domain switch (delta warmup)              | ~2-3s |
 
 ### KV Cache Quantization
 
@@ -172,17 +173,18 @@ text = generate("mlx-community/Qwen3-Coder-Next-4bit",
 ```
 
 | Context Length | fp16 KV | 8-bit KV |
-|---------------|--------:|---------:|
-| 4K tokens | 384 MB | ~210 MB |
-| 8K tokens | 768 MB | ~420 MB |
-| 16K tokens | 1.5 GB | ~820 MB |
-| 32K tokens | 3.0 GB | ~1.6 GB |
+| -------------- | ------: | -------: |
+| 4K tokens      |  384 MB |  ~210 MB |
+| 8K tokens      |  768 MB |  ~420 MB |
+| 16K tokens     |  1.5 GB |  ~820 MB |
+| 32K tokens     |  3.0 GB |  ~1.6 GB |
 
 Uses mlx-lm's `QuantizedKVCache` with `quantized_kv_start=0` (quantize from the first token). Available on all APIs: `generate`, `stream_generate`, `Session`, and `mlx-moe serve`.
 
 ### Multi-Turn Stability
 
 Tested over 20 turns with varied prompts:
+
 - Memory growth: **+0.00 GB** (19.04 GB flat)
 - Speed: 5-20 tok/s (improves as caches warm)
 - No KV cache leak, no degradation wall
