@@ -110,6 +110,7 @@ def _startup(model_name, prompt, cache_dir=None, profile_path=None,
     cache_path = None
     prepacked_path = None
     if cache_dir is not None:
+        cache_dir = os.path.expanduser(cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
         safe_name = model_name.replace("/", "--")
         cache_path = os.path.join(cache_dir, f"{safe_name}.json")
