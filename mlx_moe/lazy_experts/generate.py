@@ -31,8 +31,16 @@ from .persistence import (
 _WARMUP_CACHE = 256 * 1024 * 1024
 
 
-def _startup(model_name, prompt, cache_dir=None, profile_path=None,
-                   prepacked=True, capacity=None, warmup="hybrid"):
+def _startup(
+    model_name,
+    prompt,
+    cache_dir=None,
+    profile_path=None,
+    prepacked=True,
+    capacity=None,
+    warmup="hybrid",
+    pin_top_k: int | None = None,
+):
     """Shared startup for generate and stream_generate.
 
     Args:
@@ -165,7 +173,9 @@ def _startup(model_name, prompt, cache_dir=None, profile_path=None,
             t0 = time.perf_counter()
             profile = load_universal_profile(profile_path)
             with _with_cache_limit_zero(_WARMUP_CACHE):
-                upgrade_from_profile(model, model_path, capacity, profile)
+                upgrade_from_profile(
+                    model, model_path, capacity, profile, pin_top_k=pin_top_k
+                )
             print(f"  Profile-based upgrade: {time.perf_counter() - t0:.1f}s")
         else:
             t0 = time.perf_counter()
@@ -224,7 +234,8 @@ def generate(model_name: str, prompt: str, max_tokens: int = 200,
                    prepacked: bool = True,
                    capacity: int | None = None,
                    kv_bits: int | None = None,
-                   warmup: str = "hybrid") -> str:
+                   warmup: str = "hybrid",
+                   pin_top_k: int | None = None) -> str:
     """One-call generation with all optimizations.
 
     Args:
@@ -238,6 +249,7 @@ def generate(model_name: str, prompt: str, max_tokens: int = 200,
         kv_bits: Quantize KV cache to this many bits (8 recommended). Saves ~45%
             KV memory at 8-bit. None = fp16 (default).
         warmup: "hybrid" (default), "full", or "none".
+        pin_top_k: If set, pin top-K profile experts per layer. Use 0 for no pinning.
 
     Returns:
         Generated text string.
@@ -247,7 +259,7 @@ def generate(model_name: str, prompt: str, max_tokens: int = 200,
     model, tokenizer, _ = _startup(
         model_name, prompt, cache_dir=cache_dir,
         profile_path=profile_path, prepacked=prepacked, capacity=capacity,
-        warmup=warmup)
+        warmup=warmup, pin_top_k=pin_top_k)
 
     kv_kwargs = {}
     if kv_bits is not None:
@@ -263,7 +275,8 @@ def stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
                           prepacked: bool = True,
                           capacity: int | None = None,
                           kv_bits: int | None = None,
-                          warmup: str = "hybrid"):
+                          warmup: str = "hybrid",
+                          pin_top_k: int | None = None):
     """Streaming variant of generate.
 
     Startup is blocking. After startup, yields GenerationResponse objects
@@ -277,7 +290,7 @@ def stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
     model, tokenizer, _ = _startup(
         model_name, prompt, cache_dir=cache_dir,
         profile_path=profile_path, prepacked=prepacked, capacity=capacity,
-        warmup=warmup)
+        warmup=warmup, pin_top_k=pin_top_k)
 
     kv_kwargs = {}
     if kv_bits is not None:
@@ -304,13 +317,15 @@ class Session:
 
     def __init__(self, model_name: str, cache_dir: str | None = None,
                  profile_path: str | None = None, prepacked: bool = True,
-                 capacity: int | None = None, kv_bits: int | None = None):
+                 capacity: int | None = None, kv_bits: int | None = None,
+                 pin_top_k: int | None = None):
         self._model_name = model_name
         self._cache_dir = cache_dir
         self._profile_path = profile_path
         self._prepacked = prepacked
         self._capacity = capacity
         self._kv_bits = kv_bits
+        self._pin_top_k = pin_top_k
         self._model = None
         self._tokenizer = None
         self._model_path = None
@@ -321,7 +336,7 @@ class Session:
             self._model, self._tokenizer, self._model_path = _startup(
                 self._model_name, prompt, cache_dir=self._cache_dir,
                 profile_path=self._profile_path, prepacked=self._prepacked,
-                capacity=self._capacity)
+                capacity=self._capacity, pin_top_k=self._pin_top_k)
             self._last_prompt = prompt
         elif self._last_prompt != prompt:
             t0 = time.perf_counter()

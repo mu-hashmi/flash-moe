@@ -1,14 +1,14 @@
 import asyncio
+from collections import OrderedDict
 import json
-import os
 import re
-import signal
 import time
 import uuid
 from pathlib import Path
 
 MAX_TOKENS_CAP = 4096
 MAX_INPUT_TOKENS = 16384
+DEFAULT_SHUTDOWN_TIMEOUT = 5
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -23,16 +23,18 @@ if not sys.stdout.isatty():
     print = functools.partial(print, flush=True)
 
 
-def _find_profile(model_name: str) -> str | None:
-    profiles_dir = Path(__file__).parent.parent / "profiles"
+def _find_profile(model_name: str, profiles_dir: Path | None = None) -> str | None:
+    if profiles_dir is None:
+        profiles_dir = Path(__file__).parent.parent / "profiles"
     if not profiles_dir.is_dir():
         return None
     slug = model_name.split("/")[-1].lower()
     for suffix in ("-4bit", "-8bit", "-bf16", "-fp16"):
         slug = slug.removesuffix(suffix)
-    for f in profiles_dir.iterdir():
-        if f.suffix == ".json" and f.stem == slug:
-            return str(f)
+    for stem in (f"{slug}-toolchat", slug):
+        candidate = profiles_dir / f"{stem}.json"
+        if candidate.is_file():
+            return str(candidate)
     return None
 
 
@@ -108,7 +110,7 @@ def _convert_tools_anthropic_to_openai(tools: list) -> list:
 
 
 MODEL_SAMPLING_DEFAULTS = {
-    "qwen3-coder": {"temp": 1.0, "top_p": 0.95, "top_k": 40},
+    "qwen3-coder": {"temp": 0.2, "top_p": 0.95, "top_k": 40},
 }
 
 
@@ -132,10 +134,43 @@ def _sampling_kwargs(body: dict, model_name: str) -> dict:
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_MAX_SUPPRESSED_THINK_TOKENS = 256
 
 
 def _strip_thinking(text: str) -> str:
     return _THINK_RE.sub("", text)
+
+
+def _filter_thinking_piece(
+    text: str,
+    in_thinking: bool,
+    think_start: str,
+    think_end: str,
+) -> tuple[str, bool]:
+    if not text:
+        return text, in_thinking
+
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if not in_thinking:
+            j = text.find(think_start, i)
+            if j < 0:
+                out.append(text[i:])
+                break
+            out.append(text[i:j])
+            i = j + len(think_start)
+            in_thinking = True
+        else:
+            j = text.find(think_end, i)
+            if j < 0:
+                i = n
+                break
+            i = j + len(think_end)
+            in_thinking = False
+
+    return "".join(out), in_thinking
 
 
 def _make_msg_id():
@@ -149,13 +184,16 @@ def _make_chatcmpl_id():
 class Server:
     def __init__(self, model_name: str, capacity: int | None = None,
                  profile_path: str | None = None,
+                 pin_top_k: int | None = None,
                  max_tokens: int = MAX_TOKENS_CAP,
                  max_input_tokens: int = MAX_INPUT_TOKENS,
                  kv_bits: int | None = None,
-                 warmup: str = "hybrid"):
+                 warmup: str = "hybrid",
+                 kv_cache_slots: int = 1):
         self._model_name = model_name
         self._capacity = capacity
         self._profile_path = profile_path or _find_profile(model_name)
+        self._pin_top_k = pin_top_k
         self._model = None
         self._tokenizer = None
         self._lock = asyncio.Lock()
@@ -164,75 +202,174 @@ class Server:
         self._max_input_tokens = max_input_tokens
         self._kv_bits = kv_bits
         self._warmup = warmup
-        self._cached_tokens = None
-        self._cached_kv = None
+        self._kv_cache_slots = max(1, kv_cache_slots)
+        self._kv_cache = OrderedDict()
 
     def load(self):
         from .lazy_experts.generate import _startup
-        # Startup without hybrid warmup — defer to first real request
+        warmup_prompt = "Write a Python function that implements binary search on a sorted array."
         model, tokenizer, _ = _startup(
-            self._model_name, "Hello",
+            self._model_name, warmup_prompt,
             cache_dir=str(Path.home() / ".cache" / "mlx-moe"),
             profile_path=self._profile_path,
             capacity=self._capacity,
-            warmup="none",
+            warmup=self._warmup,
+            pin_top_k=self._pin_top_k,
         )
         self._model = model
         self._tokenizer = tokenizer
         self._memory_gb = mx.get_active_memory() / 1e9
-        self._needs_warmup = self._warmup == "hybrid"
+        if self._warmup == "hybrid":
+            self._run_startup_refinement()
 
-    def _warmup_on_first_request(self, prompt: str):
-        """Run hybrid warmup — short prompt to avoid prefilling the user's full context."""
+    def _run_startup_refinement(self) -> None:
         import mlx_lm as _mlx_lm
         from .lazy_experts.core import dynamic_cache_update
-        import time
-        # Use a short coding-relevant prompt, not the user's 14K token context
-        warmup_prompt = "Write a Python function that implements binary search on a sorted array."
-        if self._tokenizer.has_chat_template:
-            warmup_prompt = self._tokenizer.apply_chat_template(
-                [{"role": "user", "content": warmup_prompt}],
-                add_generation_prompt=True, tokenize=False)
-        t0 = time.perf_counter()
-        for resp in _mlx_lm.stream_generate(self._model, self._tokenizer,
-                                             prompt=warmup_prompt, max_tokens=10):
-            dynamic_cache_update(self._model, max_layer_updates=48)
-        swaps = sum(s.get("swaps", 0)
-                    for s in dynamic_cache_update(self._model, max_layer_updates=48))
-        print(f"  Hybrid warmup: {time.perf_counter() - t0:.1f}s "
-              f"({swaps} expert swaps)")
 
-    def _stream(self, prompt: str, max_tokens: int, **sampling):
+        prompts = [
+            "Write Python code that validates JSON input and returns structured errors.",
+            "Write a Python function with unit tests for edge cases.",
+        ]
+
+        kv_kwargs = {}
+        if self._kv_bits is not None:
+            kv_kwargs = dict(kv_bits=self._kv_bits, kv_group_size=64, quantized_kv_start=0)
+
+        t0 = time.perf_counter()
+        calls = 0
+        total_swaps = 0
+        total_requests = 0
+        total_fallbacks = 0
+
+        def _accumulate(stats: list[dict]) -> tuple[int, int]:
+            nonlocal calls, total_swaps, total_requests, total_fallbacks
+            calls += 1
+            swaps = sum(s.get("swaps", 0) for s in stats)
+            requests = sum(s.get("requests", 0) for s in stats)
+            fallbacks = sum(s.get("fallbacks", 0) for s in stats)
+            total_swaps += swaps
+            total_requests += requests
+            total_fallbacks += fallbacks
+            return swaps, requests
+
+        round_rates = []
+        for prompt_text in prompts:
+            prompt = prompt_text
+            if self._tokenizer.has_chat_template:
+                prompt = self._tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt_text}],
+                    add_generation_prompt=True, tokenize=False,
+                )
+
+            req_before = total_requests
+            fb_before = total_fallbacks
+            token_i = 0
+            for _ in _mlx_lm.stream_generate(
+                self._model, self._tokenizer, prompt=prompt, max_tokens=24, **kv_kwargs
+            ):
+                token_i += 1
+                budget = 48 if token_i <= 12 else 32
+                _accumulate(dynamic_cache_update(self._model, max_layer_updates=budget))
+
+            for _ in range(8):
+                swaps, requests = _accumulate(dynamic_cache_update(self._model, max_layer_updates=32))
+                if swaps == 0 and requests == 0:
+                    break
+
+            round_requests = total_requests - req_before
+            round_fallbacks = total_fallbacks - fb_before
+            if round_requests > 0:
+                round_rates.append(round_fallbacks / round_requests)
+
+        fallback_rate = (total_fallbacks / total_requests) if total_requests > 0 else 0.0
+        round_str = ",".join(f"{r * 100:.2f}%" for r in round_rates) if round_rates else "n/a"
+        print(
+            f"  Startup refine: {time.perf_counter() - t0:.1f}s "
+            f"(calls={calls}, swaps={total_swaps}, fallback_rate={fallback_rate * 100:.2f}%, "
+            f"round_rates={round_str})"
+        )
+
+    def _encode_prompt(self, prompt: str) -> list[int]:
+        tokenizer = self._tokenizer
+        add_special = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
+        return tokenizer.encode(prompt, add_special_tokens=add_special)
+
+    def _cache_key_from_body(self, body: dict) -> str:
+        key = body.get("cache_key") or body.get("session_id")
+        if key is None and isinstance(body.get("metadata"), dict):
+            key = body["metadata"].get("cache_key") or body["metadata"].get("session_id")
+        if key is None and body.get("user") is not None:
+            key = str(body["user"])
+        return str(key) if key is not None else "default"
+
+    def _put_kv_cache(self, cache_key: str, tokens: list[int], kv_cache) -> None:
+        self._kv_cache[cache_key] = (tokens, kv_cache)
+        self._kv_cache.move_to_end(cache_key)
+        while len(self._kv_cache) > self._kv_cache_slots:
+            self._kv_cache.popitem(last=False)
+
+    @staticmethod
+    def _dynamic_update_policy(
+        generation_tokens: int,
+        last_fallback_rate: float,
+        no_swap_streak: int,
+        low_fallback_streak: int,
+    ) -> tuple[int, int]:
+        if last_fallback_rate >= 0.35:
+            interval, budget = 1, 48
+        elif last_fallback_rate >= 0.20:
+            interval, budget = 1, 32
+        elif last_fallback_rate >= 0.10:
+            interval, budget = 2, 24
+        elif generation_tokens <= 32:
+            interval, budget = 2, 24
+        elif generation_tokens <= 96:
+            interval, budget = 3, 16
+        else:
+            interval, budget = 4, 12
+
+        if no_swap_streak >= 4 and last_fallback_rate < 0.15:
+            interval *= 2
+            budget = max(8, budget // 2)
+
+        if low_fallback_streak >= 6 and last_fallback_rate < 0.08:
+            interval = max(interval, 12)
+            budget = 8
+
+        if low_fallback_streak >= 12 and last_fallback_rate < 0.05:
+            interval = max(interval, 20)
+            budget = 8
+
+        return interval, budget
+
+    def _stream(self, prompt_tokens: list[int], max_tokens: int,
+                cache_key: str, **sampling):
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.models import cache as cache_module
         from .lazy_experts.core import dynamic_cache_update
-        if self._needs_warmup:
-            self._warmup_on_first_request(prompt)
-            self._needs_warmup = False
-
-        # Tokenize prompt (matching stream_generate's logic for consistent token IDs)
-        tokenizer = self._tokenizer
-        add_special = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
-        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=add_special)
 
         # Find longest common prefix with cached KV from previous request
         prompt_cache = None
         prefix_len = 0
-        if self._cached_tokens is not None:
-            cached = self._cached_tokens
-            min_len = min(len(cached), len(prompt_tokens))
-            while prefix_len < min_len and cached[prefix_len] == prompt_tokens[prefix_len]:
+        cached = self._kv_cache.get(cache_key)
+        cached_tokens = None
+        cached_kv = None
+        if cached is not None:
+            cached_tokens, cached_kv = cached
+            self._kv_cache.move_to_end(cache_key)
+            min_len = min(len(cached_tokens), len(prompt_tokens))
+            while prefix_len < min_len and cached_tokens[prefix_len] == prompt_tokens[prefix_len]:
                 prefix_len += 1
 
         if prefix_len > 0:
             # generate_step requires at least 1 input token
             if prefix_len >= len(prompt_tokens):
                 prefix_len = len(prompt_tokens) - 1
-            trim_amount = len(self._cached_tokens) - prefix_len
+            trim_amount = len(cached_tokens) - prefix_len
             if trim_amount > 0:
-                cache_module.trim_prompt_cache(self._cached_kv, trim_amount)
-            prompt_cache = self._cached_kv
+                cache_module.trim_prompt_cache(cached_kv, trim_amount)
+            prompt_cache = cached_kv
             suffix = prompt_tokens[prefix_len:]
             print(f"  [kv cache: reusing {prefix_len}, processing {len(suffix)} new tokens]")
         else:
@@ -240,30 +377,91 @@ class Server:
             prompt_cache = cache_module.make_prompt_cache(self._model)
 
         # Invalidate cache before generation — restored on successful completion
-        self._cached_tokens = None
-        self._cached_kv = None
+        self._kv_cache.pop(cache_key, None)
 
         kv_kwargs = {}
         if self._kv_bits is not None:
             kv_kwargs = dict(kv_bits=self._kv_bits, kv_group_size=64, quantized_kv_start=0)
 
         generated_tokens = []
-        for resp in _mlx_lm.stream_generate(
-            self._model, tokenizer, prompt=mx.array(suffix),
-            max_tokens=max_tokens, sampler=make_sampler(**sampling),
-            prompt_cache=prompt_cache, **kv_kwargs,
-        ):
-            generated_tokens.append(resp.token)
-            yield resp
-            t = resp.generation_tokens
-            if t <= 10:
-                dynamic_cache_update(self._model, max_layer_updates=48)
-            elif t <= 30 and t % 3 == 0:
-                dynamic_cache_update(self._model, max_layer_updates=24)
+        request_t0 = time.perf_counter()
+        first_token_at = None
+        prompt_tps = 0.0
+        prompt_len = len(suffix)
+        gen_tokens = 0
+        decode_tps = 0.0
+        dcu_calls = 0
+        dcu_swaps = 0
+        dcu_requests = 0
+        dcu_fallbacks = 0
+        no_swap_streak = 0
+        low_fallback_streak = 0
+        last_window_fallback_rate = 1.0
+        complete = False
 
-        # Save KV cache + token sequence for next request's prefix matching
-        self._cached_tokens = prompt_tokens + generated_tokens
-        self._cached_kv = prompt_cache
+        try:
+            for resp in _mlx_lm.stream_generate(
+                self._model, self._tokenizer, prompt=mx.array(suffix),
+                max_tokens=max_tokens, sampler=make_sampler(**sampling),
+                prompt_cache=prompt_cache, **kv_kwargs,
+            ):
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
+                    prompt_tps = resp.prompt_tps
+                    prompt_len = int(resp.prompt_tokens)
+                generated_tokens.append(resp.token)
+                gen_tokens = resp.generation_tokens
+                decode_tps = resp.generation_tps
+                yield resp
+
+                interval, budget = self._dynamic_update_policy(
+                    resp.generation_tokens,
+                    last_window_fallback_rate,
+                    no_swap_streak,
+                    low_fallback_streak,
+                )
+                if resp.generation_tokens % interval != 0:
+                    continue
+
+                stats = dynamic_cache_update(self._model, max_layer_updates=budget)
+                dcu_calls += 1
+                swaps = sum(s.get("swaps", 0) for s in stats)
+                fallbacks = sum(s.get("fallbacks", 0) for s in stats)
+                requests = sum(s.get("requests", 0) for s in stats)
+                dcu_swaps += swaps
+                dcu_fallbacks += fallbacks
+                dcu_requests += requests
+
+                if requests > 0:
+                    last_window_fallback_rate = fallbacks / requests
+
+                if swaps == 0:
+                    no_swap_streak += 1
+                else:
+                    no_swap_streak = 0
+
+                if requests > 0:
+                    if (fallbacks / requests) <= 0.005:
+                        low_fallback_streak += 1
+                    else:
+                        low_fallback_streak = 0
+
+            complete = True
+        finally:
+            if complete:
+                self._put_kv_cache(cache_key, prompt_tokens + generated_tokens, prompt_cache)
+
+            if first_token_at is not None:
+                prefill_ms = (prompt_len / prompt_tps * 1000.0) if prompt_tps > 0 else 0.0
+                ttft_ms = (first_token_at - request_t0) * 1000.0
+                fallback_rate = (dcu_fallbacks / dcu_requests) if dcu_requests > 0 else 0.0
+                print(
+                    f"  [telemetry] cache_key={cache_key} "
+                    f"prefill={prefill_ms:.1f}ms ttft={ttft_ms:.1f}ms "
+                    f"decode={decode_tps:.1f} tok/s tokens={gen_tokens} "
+                    f"dcu_calls={dcu_calls} swaps={dcu_swaps} "
+                    f"fallback_rate={fallback_rate * 100:.2f}%"
+                )
 
     def _tokenize_messages(self, messages: list, tools: list | None = None) -> str:
         tokenizer = self._tokenizer
@@ -311,24 +509,32 @@ class Server:
         stream = body.get("stream", False)
         tools = body.get("tools")
         sampling = _sampling_kwargs(body, self._model_name)
+        cache_key = self._cache_key_from_body(body)
 
         formatted = _format_messages(messages)
         prompt = self._tokenize_messages(formatted, tools=tools)
-        input_tokens = len(self._tokenizer.encode(prompt))
+        prompt_tokens = self._encode_prompt(prompt)
+        input_tokens = len(prompt_tokens)
 
         if err := self._check_input_length(input_tokens):
             return err
 
-        print(f"  [openai] max_tokens={max_tokens} stream={stream} tools={len(tools) if tools else 0} input_tokens={input_tokens}")
+        print(
+            f"  [openai] max_tokens={max_tokens} stream={stream} "
+            f"tools={len(tools) if tools else 0} input_tokens={input_tokens} "
+            f"cache_key={cache_key}"
+        )
 
         if stream:
             return StreamingResponse(
-                self._stream_openai(prompt, max_tokens, tools, **sampling),
+                self._stream_openai(prompt_tokens, max_tokens, tools, cache_key, **sampling),
                 media_type="text/event-stream",
             )
 
         async with self._lock:
-            text, gen_tokens, tps = self._generate_sync(prompt, max_tokens, **sampling)
+            text, gen_tokens, tps = self._generate_sync(
+                prompt_tokens, max_tokens, cache_key, **sampling
+            )
 
         return JSONResponse({
             "id": _make_chatcmpl_id(),
@@ -357,13 +563,15 @@ class Server:
         max_tokens = min(body.get("max_tokens", self._max_tokens), self._max_tokens)
         stream = body.get("stream", False)
         sampling = _sampling_kwargs(body, self._model_name)
+        cache_key = self._cache_key_from_body(body)
 
         tools_anthropic = body.get("tools")
         tools_openai = _convert_tools_anthropic_to_openai(tools_anthropic) if tools_anthropic else None
 
         formatted = _format_messages(messages, system=system)
         prompt = self._tokenize_messages(formatted, tools=tools_openai)
-        input_tokens = len(self._tokenizer.encode(prompt))
+        prompt_tokens = self._encode_prompt(prompt)
+        input_tokens = len(prompt_tokens)
 
         if err := self._check_input_length(input_tokens):
             return err
@@ -371,16 +579,25 @@ class Server:
         if not stream:
             max_tokens = min(max_tokens, 512)
 
-        print(f"  [anthropic] max_tokens={max_tokens} stream={stream} tools={len(tools_anthropic) if tools_anthropic else 0} msgs={len(messages)} input_tokens={input_tokens}")
+        print(
+            f"  [anthropic] max_tokens={max_tokens} stream={stream} "
+            f"tools={len(tools_anthropic) if tools_anthropic else 0} "
+            f"msgs={len(messages)} input_tokens={input_tokens} cache_key={cache_key}"
+        )
 
         if stream:
             return StreamingResponse(
-                self._stream_anthropic(prompt, max_tokens, tools_openai, input_tokens, **sampling),
+                self._stream_anthropic(
+                    prompt_tokens, max_tokens, tools_openai, input_tokens,
+                    cache_key, **sampling
+                ),
                 media_type="text/event-stream",
             )
 
         async with self._lock:
-            text, gen_tokens, tps = self._generate_sync(prompt, max_tokens, **sampling)
+            text, gen_tokens, tps = self._generate_sync(
+                prompt_tokens, max_tokens, cache_key, **sampling
+            )
 
         return JSONResponse({
             "id": _make_msg_id(),
@@ -395,11 +612,19 @@ class Server:
             },
         })
 
-    def _generate_sync(self, prompt: str, max_tokens: int, **sampling) -> tuple[str, int, float]:
+    def _generate_sync(
+        self,
+        prompt_tokens: list[int],
+        max_tokens: int,
+        cache_key: str,
+        **sampling,
+    ) -> tuple[str, int, float]:
         text = ""
         gen_tokens = 0
         tps = 0.0
-        for resp in self._stream(prompt, max_tokens=max_tokens, **sampling):
+        for resp in self._stream(
+            prompt_tokens, max_tokens=max_tokens, cache_key=cache_key, **sampling
+        ):
             text += resp.text
             gen_tokens = resp.generation_tokens
             tps = resp.generation_tps
@@ -408,8 +633,8 @@ class Server:
             print(f"  [{gen_tokens} tokens, {tps:.1f} tok/s]")
         return text, gen_tokens, tps
 
-    async def _stream_openai(self, prompt: str, max_tokens: int,
-                             tools: list | None, **sampling):
+    async def _stream_openai(self, prompt_tokens: list[int], max_tokens: int,
+                             tools: list | None, cache_key: str, **sampling):
         chat_id = _make_chatcmpl_id()
         created = int(time.time())
 
@@ -430,27 +655,42 @@ class Server:
         tool_text = ""
         tool_idx = 0
         in_thinking = False
+        suppressed_think_tokens = 0
+        thinking_filter_enabled = tokenizer.has_thinking
+        emitted_payload = False
 
         try:
             async with self._lock:
-                for resp in self._stream(prompt, max_tokens=max_tokens, **sampling):
+                for resp in self._stream(
+                    prompt_tokens, max_tokens=max_tokens, cache_key=cache_key, **sampling
+                ):
                     gen_tokens = resp.generation_tokens
                     tps = resp.generation_tps
 
-                    if tokenizer.has_thinking:
-                        if resp.text == tokenizer.think_start:
-                            in_thinking = True
-                            continue
-                        if in_thinking:
-                            if resp.text == tokenizer.think_end:
-                                in_thinking = False
+                    text_piece = resp.text
+                    if thinking_filter_enabled:
+                        filtered, in_thinking = _filter_thinking_piece(
+                            text_piece, in_thinking, tokenizer.think_start, tokenizer.think_end
+                        )
+                        if in_thinking or filtered != text_piece:
+                            suppressed_think_tokens += 1
+                        if in_thinking and suppressed_think_tokens >= _MAX_SUPPRESSED_THINK_TOKENS:
+                            thinking_filter_enabled = False
+                            in_thinking = False
+                            filtered = text_piece
+                            print(
+                                "  [WARNING: disabling thinking suppression "
+                                f"after {_MAX_SUPPRESSED_THINK_TOKENS} tokens]"
+                            )
+                        text_piece = filtered
+                        if not text_piece:
                             continue
 
-                    if has_tools and resp.text == tokenizer.tool_call_start:
+                    if has_tools and text_piece == tokenizer.tool_call_start:
                         in_tool_call = True
                         continue
                     if in_tool_call:
-                        if resp.text == tokenizer.tool_call_end:
+                        if text_piece == tokenizer.tool_call_end:
                             in_tool_call = False
                             parsed = tokenizer.tool_parser(tool_text, tools)
                             if not isinstance(parsed, list):
@@ -467,6 +707,7 @@ class Server:
                                     }, "finish_reason": None}],
                                 }
                                 yield f"data: {json.dumps(chunk)}\n\n"
+                                emitted_payload = True
                                 chunk = {
                                     "id": chat_id, "object": "chat.completion.chunk",
                                     "created": created, "model": self._model_id,
@@ -475,23 +716,64 @@ class Server:
                                     }, "finish_reason": None}],
                                 }
                                 yield f"data: {json.dumps(chunk)}\n\n"
+                                emitted_payload = True
                                 tool_idx += 1
                             tool_text = ""
                             finish = "tool_calls"
                             continue
-                        tool_text += resp.text
+                        tool_text += text_piece
                         continue
 
                     chunk = {
                         "id": chat_id, "object": "chat.completion.chunk",
                         "created": created, "model": self._model_id,
-                        "choices": [{"index": 0, "delta": {"content": resp.text}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": text_piece}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
+                    emitted_payload = True
                     await asyncio.sleep(0)
 
                     if resp.finish_reason == "length":
                         finish = "length"
+
+            if in_tool_call and tool_text:
+                print(f"  [WARNING: tool call truncated at {gen_tokens} tokens, {len(tool_text)} chars buffered]")
+                try:
+                    parsed = tokenizer.tool_parser(tool_text, tools)
+                    if not isinstance(parsed, list):
+                        parsed = [parsed]
+                    for tc in parsed:
+                        tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:12]}"
+                        args_str = json.dumps(tc["arguments"], ensure_ascii=False)
+                        chunk = {
+                            "id": chat_id, "object": "chat.completion.chunk",
+                            "created": created, "model": self._model_id,
+                            "choices": [{"index": 0, "delta": {
+                                "tool_calls": [{"index": tool_idx, "id": tc_id, "type": "function",
+                                                "function": {"name": tc["name"], "arguments": ""}}],
+                            }, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        emitted_payload = True
+                        chunk = {
+                            "id": chat_id, "object": "chat.completion.chunk",
+                            "created": created, "model": self._model_id,
+                            "choices": [{"index": 0, "delta": {
+                                "tool_calls": [{"index": tool_idx, "function": {"arguments": args_str}}],
+                            }, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        emitted_payload = True
+                        tool_idx += 1
+                    finish = "tool_calls"
+                except Exception:
+                    print("  [tool call unrecoverable, dropping]")
+
+            if not emitted_payload and gen_tokens > 0:
+                print(
+                    f"  [WARNING: generated {gen_tokens} tokens but emitted no visible output; "
+                    "model likely stayed in an unterminated control block]"
+                )
 
             chunk = {
                 "id": chat_id, "object": "chat.completion.chunk",
@@ -505,8 +787,9 @@ class Server:
         except (OSError, asyncio.CancelledError):
             print(f"  [client disconnected after {gen_tokens} tokens]")
 
-    async def _stream_anthropic(self, prompt: str, max_tokens: int,
-                                tools: list | None, input_tokens: int, **sampling):
+    async def _stream_anthropic(self, prompt_tokens: list[int], max_tokens: int,
+                                tools: list | None, input_tokens: int,
+                                cache_key: str, **sampling):
         msg_id = _make_msg_id()
 
         event = {
@@ -530,30 +813,44 @@ class Server:
         tool_text = ""
         text_block_open = False
         in_thinking = False
+        suppressed_think_tokens = 0
+        thinking_filter_enabled = tokenizer.has_thinking
 
         try:
             async with self._lock:
-                for resp in self._stream(prompt, max_tokens=max_tokens, **sampling):
+                for resp in self._stream(
+                    prompt_tokens, max_tokens=max_tokens, cache_key=cache_key, **sampling
+                ):
                     gen_tokens = resp.generation_tokens
                     tps = resp.generation_tps
 
-                    if tokenizer.has_thinking:
-                        if resp.text == tokenizer.think_start:
-                            in_thinking = True
-                            continue
-                        if in_thinking:
-                            if resp.text == tokenizer.think_end:
-                                in_thinking = False
+                    text_piece = resp.text
+                    if thinking_filter_enabled:
+                        filtered, in_thinking = _filter_thinking_piece(
+                            text_piece, in_thinking, tokenizer.think_start, tokenizer.think_end
+                        )
+                        if in_thinking or filtered != text_piece:
+                            suppressed_think_tokens += 1
+                        if in_thinking and suppressed_think_tokens >= _MAX_SUPPRESSED_THINK_TOKENS:
+                            thinking_filter_enabled = False
+                            in_thinking = False
+                            filtered = text_piece
+                            print(
+                                "  [WARNING: disabling thinking suppression "
+                                f"after {_MAX_SUPPRESSED_THINK_TOKENS} tokens]"
+                            )
+                        text_piece = filtered
+                        if not text_piece:
                             continue
 
-                    if has_tools and resp.text == tokenizer.tool_call_start:
+                    if has_tools and text_piece == tokenizer.tool_call_start:
                         if text_block_open:
                             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_idx - 1})}\n\n"
                             text_block_open = False
                         in_tool_call = True
                         continue
                     if in_tool_call:
-                        if resp.text == tokenizer.tool_call_end:
+                        if text_piece == tokenizer.tool_call_end:
                             in_tool_call = False
                             parsed = tokenizer.tool_parser(tool_text, tools)
                             if not isinstance(parsed, list):
@@ -576,7 +873,7 @@ class Server:
                             tool_text = ""
                             stop_reason = "tool_use"
                             continue
-                        tool_text += resp.text
+                        tool_text += text_piece
                         continue
 
                     if not text_block_open:
@@ -590,7 +887,7 @@ class Server:
 
                     event = {
                         "type": "content_block_delta", "index": content_idx - 1,
-                        "delta": {"type": "text_delta", "text": resp.text},
+                        "delta": {"type": "text_delta", "text": text_piece},
                     }
                     yield f"event: content_block_delta\ndata: {json.dumps(event)}\n\n"
                     await asyncio.sleep(0)
@@ -644,23 +941,31 @@ class Server:
 
 def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                capacity: int | None = None, profile_path: str | None = None,
+               pin_top_k: int | None = None,
                max_tokens: int = MAX_TOKENS_CAP,
                max_input_tokens: int = MAX_INPUT_TOKENS,
                kv_bits: int | None = None,
-               warmup: str = "hybrid"):
+               warmup: str = "hybrid",
+               kv_cache_slots: int = 1,
+               shutdown_timeout: int = DEFAULT_SHUTDOWN_TIMEOUT):
     import uvicorn
-    from contextlib import asynccontextmanager
 
     server = Server(model_name, capacity=capacity, profile_path=profile_path,
+                    pin_top_k=pin_top_k,
                     max_tokens=max_tokens, max_input_tokens=max_input_tokens,
-                    kv_bits=kv_bits, warmup=warmup)
+                    kv_bits=kv_bits, warmup=warmup,
+                    kv_cache_slots=kv_cache_slots)
 
     print(f"mlx-moe serve")
     print(f"  Model:    {model_name}")
     print(f"  Profile:  {server._profile_path or 'none'}")
+    if pin_top_k is not None:
+        print(f"  Pin top-k: {pin_top_k}")
     print(f"  Endpoint: http://{host}:{port}")
     defaults = _sampling_defaults(model_name)
     print(f"  Limits:   {max_input_tokens} input, {max_tokens} output")
+    print(f"  KV cache: {kv_cache_slots} slot(s)")
+    print(f"  Shutdown: {shutdown_timeout}s graceful timeout")
     if defaults:
         print(f"  Sampling: {defaults}")
     print()
@@ -670,18 +975,18 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
     print(f"  Ready.")
     print()
 
-    @asynccontextmanager
-    async def lifespan(app):
-        signal.signal(signal.SIGINT, lambda *_: os._exit(0))
-        yield
-
     app = Starlette(
         routes=[
             Route("/v1/models", server.handle_models, methods=["GET"]),
             Route("/v1/chat/completions", server.handle_chat_completions, methods=["POST"]),
             Route("/v1/messages", server.handle_messages, methods=["POST"]),
         ],
-        lifespan=lifespan,
     )
 
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="warning",
+        timeout_graceful_shutdown=shutdown_timeout,
+    )

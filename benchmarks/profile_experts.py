@@ -15,7 +15,9 @@ Examples:
 
 import argparse
 import json
+import random
 import time
+from copy import deepcopy
 from collections import defaultdict
 from pathlib import Path
 
@@ -23,8 +25,10 @@ import mlx.core as mx
 import mlx_lm
 import numpy as np
 from mlx_lm.utils import hf_repo_to_path
+from tool_chat_scenarios import get_profile_scenarios, render_scenario_prompt
 from mlx_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, reset_to_cached,
+    router_only_discovery,
     _find_switch_mlp, _detect_num_experts,
     CachedQuantizedSwitchLinear, PredictiveCachedSwitchLinear,
 )
@@ -94,9 +98,9 @@ PROMPTS_CODING = [
 PROMPT_PRESETS = {
     "diverse": PROMPTS_DIVERSE,
     "coding": PROMPTS_CODING,
+    "tool-chat": None,
+    "mixed": None,
 }
-
-PROMPTS = PROMPTS_DIVERSE
 
 
 def apply_chat_template(tokenizer, text):
@@ -111,14 +115,22 @@ def apply_chat_template(tokenizer, text):
     return text
 
 
-def collect_expert_activations(model, tokenizer, model_path, prompt, capacity,
-                               use_chat_template=False):
+def collect_expert_activations(
+    model,
+    tokenizer,
+    model_path,
+    prompt,
+    capacity,
+    discovery_mode: str,
+):
     """Run warmup + upgrade for one prompt, return per-layer expert sets."""
     reset_to_cached(model, model_path, capacity)
 
-    formatted = apply_chat_template(tokenizer, prompt) if use_chat_template else prompt
-    mlx_lm.generate(model, tokenizer, prompt=formatted,
-                    max_tokens=WARMUP_TOKENS, verbose=False)
+    if discovery_mode == "router-only":
+        router_only_discovery(model, tokenizer, prompt, max_tokens=WARMUP_TOKENS)
+    else:
+        mlx_lm.generate(model, tokenizer, prompt=prompt,
+                        max_tokens=WARMUP_TOKENS, verbose=False)
 
     # Harvest discovered experts from LCP caches before upgrade
     layer_experts = {}
@@ -152,6 +164,71 @@ def collect_expert_activations(model, tokenizer, model_path, prompt, capacity,
     return layer_experts
 
 
+def _sample_items(pool: list, n: int, rng: random.Random) -> list:
+    if n <= 0:
+        return []
+    if not pool:
+        return []
+    sampled = []
+    while len(sampled) < n:
+        batch = list(pool)
+        rng.shuffle(batch)
+        take = min(n - len(sampled), len(batch))
+        sampled.extend(batch[:take])
+    return [deepcopy(item) for item in sampled]
+
+
+def build_mixed_prompt_items(
+    coding_weight: int,
+    toolchat_weight: int,
+    num_prompts: int,
+    seed: int,
+) -> list:
+    if coding_weight < 0 or toolchat_weight < 0:
+        raise ValueError("coding_weight and toolchat_weight must be >= 0")
+    if num_prompts <= 0:
+        raise ValueError("num_prompts must be > 0")
+    total_weight = coding_weight + toolchat_weight
+    if total_weight <= 0:
+        raise ValueError("coding_weight + toolchat_weight must be > 0")
+
+    coding_n = int(round(num_prompts * coding_weight / total_weight))
+    toolchat_n = num_prompts - coding_n
+    rng = random.Random(seed)
+
+    coding_items = _sample_items(PROMPTS_CODING, coding_n, rng)
+    toolchat_items = _sample_items(get_profile_scenarios(), toolchat_n, rng)
+    mixed = coding_items + toolchat_items
+    rng.shuffle(mixed)
+    return mixed
+
+
+def resolve_prompt_items(
+    preset: str,
+    coding_weight: int = 70,
+    toolchat_weight: int = 30,
+    num_prompts: int = 24,
+    seed: int = 0,
+) -> list:
+    if preset == "tool-chat":
+        return get_profile_scenarios()
+    if preset == "mixed":
+        return build_mixed_prompt_items(
+            coding_weight=coding_weight,
+            toolchat_weight=toolchat_weight,
+            num_prompts=num_prompts,
+            seed=seed,
+        )
+    return PROMPT_PRESETS[preset]
+
+
+def render_prompt_item(tokenizer, item, use_chat_template: bool) -> tuple[str, str]:
+    if isinstance(item, dict):
+        return item["name"], render_scenario_prompt(tokenizer, item)
+    prompt = apply_chat_template(tokenizer, item) if use_chat_template else item
+    return item, prompt
+
+
 def main():
     parser = argparse.ArgumentParser(description="Profile expert routing for universal expert identification")
     parser.add_argument("--model", "-m", default="qwen",
@@ -163,12 +240,18 @@ def main():
     parser.add_argument("--output", "-o", default=None,
                         help="Output JSON path (default: <model>_experts.json)")
     parser.add_argument("--prompts", "-p", choices=list(PROMPT_PRESETS.keys()),
-                        default=None, help="Prompt preset (default: diverse)")
+                        default="diverse", help="Prompt preset (default: diverse)")
+    parser.add_argument("--coding-weight", type=int, default=70,
+                        help="Coding prompt weight for --prompts mixed (default: 70)")
+    parser.add_argument("--toolchat-weight", type=int, default=30,
+                        help="Tool-chat prompt weight for --prompts mixed (default: 30)")
+    parser.add_argument("--num-prompts", type=int, default=24,
+                        help="Total sampled prompts for --prompts mixed (default: 24)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Sampling seed for --prompts mixed (default: 0)")
+    parser.add_argument("--discovery", choices=["warmup", "router-only"], default=None,
+                        help="Discovery method (default: warmup, auto router-only for tool-chat/mixed)")
     args = parser.parse_args()
-
-    if args.prompts:
-        global PROMPTS
-        PROMPTS = PROMPT_PRESETS[args.prompts]
 
     if args.model in MODEL_PRESETS:
         model_name, default_capacity = MODEL_PRESETS[args.model]
@@ -181,13 +264,30 @@ def main():
     capacity = args.capacity if args.capacity is not None else default_capacity
     output_path = args.output or f"{short_name}_experts.json"
     use_chat_template = args.model in ("mixtral", "glm", "qwen2-moe", "qwen3-30b") or "instruct" in model_name.lower()
+    prompt_items = resolve_prompt_items(
+        args.prompts,
+        coding_weight=args.coding_weight,
+        toolchat_weight=args.toolchat_weight,
+        num_prompts=args.num_prompts,
+        seed=args.seed,
+    )
+    discovery_mode = args.discovery or (
+        "router-only" if args.prompts in ("tool-chat", "mixed") else "warmup"
+    )
 
     model_path = hf_repo_to_path(model_name)
     print(f"Model: {model_name}")
     print(f"Model path: {model_path}")
     print(f"Capacity: {capacity}, Threshold: {args.threshold}")
-    print(f"Chat template: {use_chat_template}")
-    print(f"Prompts: {len(PROMPTS)}")
+    print(f"Prompt preset: {args.prompts}")
+    if args.prompts == "mixed":
+        print(
+            f"Mix: coding={args.coding_weight} tool-chat={args.toolchat_weight} "
+            f"num_prompts={args.num_prompts} seed={args.seed}"
+        )
+    print(f"Discovery mode: {discovery_mode}")
+    print(f"Chat template (text presets): {use_chat_template}")
+    print(f"Prompts: {len(prompt_items)}")
 
     print("Loading model with lazy=True...")
     model, tokenizer = mlx_lm.load(model_name, lazy=True)
@@ -212,21 +312,24 @@ def main():
 
     # Bootstrap: first warmup + upgrade so reset_to_cached works in the loop
     print(f"\nBootstrap warmup...")
-    bootstrap_prompt = apply_chat_template(tokenizer, PROMPTS[0]) if use_chat_template else PROMPTS[0]
-    mlx_lm.generate(model, tokenizer, prompt=bootstrap_prompt,
-                    max_tokens=WARMUP_TOKENS, verbose=False)
+    _, bootstrap_prompt = render_prompt_item(tokenizer, prompt_items[0], use_chat_template)
+    if discovery_mode == "router-only":
+        router_only_discovery(model, tokenizer, bootstrap_prompt, max_tokens=WARMUP_TOKENS)
+    else:
+        mlx_lm.generate(model, tokenizer, prompt=bootstrap_prompt,
+                        max_tokens=WARMUP_TOKENS, verbose=False)
     upgrade_to_predictive(model, model_path, capacity)
     print(f"Metal memory: {mx.get_active_memory() / 1e9:.1f} GB")
 
     activation_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    num_prompts = len(PROMPTS)
+    num_prompts = len(prompt_items)
     t_total = time.perf_counter()
 
-    for p_idx, prompt in enumerate(PROMPTS):
+    for p_idx, item in enumerate(prompt_items):
+        prompt_name, prompt = render_prompt_item(tokenizer, item, use_chat_template)
         t0 = time.perf_counter()
         layer_experts = collect_expert_activations(
-            model, tokenizer, model_path, prompt, capacity,
-            use_chat_template=use_chat_template)
+            model, tokenizer, model_path, prompt, capacity, discovery_mode=discovery_mode)
         elapsed = time.perf_counter() - t0
 
         for layer_idx, experts in layer_experts.items():
@@ -236,7 +339,7 @@ def main():
         n_experts = sum(len(e) for e in layer_experts.values())
         print(f"  [{p_idx + 1}/{num_prompts}] {elapsed:.1f}s, "
               f"{len(layer_experts)} layers, {n_experts} total activations: "
-              f"{prompt[:50]}...")
+              f"{prompt_name[:60]}...")
 
     print(f"\nTotal profiling time: {time.perf_counter() - t_total:.0f}s")
 
@@ -247,6 +350,13 @@ def main():
         "capacity": capacity,
         "num_experts": num_experts,
         "moe_layers": moe_layers,
+        "prompt_preset": args.prompts,
+        "mix": {
+            "coding_weight": args.coding_weight,
+            "toolchat_weight": args.toolchat_weight,
+            "num_prompts": args.num_prompts,
+            "seed": args.seed,
+        } if args.prompts == "mixed" else None,
         "layers": {},
     }
 

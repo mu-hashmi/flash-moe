@@ -17,6 +17,7 @@ from mlx_moe.lazy_experts.persistence import (
     save_prepacked_weights,
     load_prepacked_weights,
     load_universal_profile,
+    upgrade_from_profile,
 )
 from mlx_moe.lazy_experts.loading import SafetensorsMap
 
@@ -200,6 +201,108 @@ class TestLoadUniversalProfile:
         assert "0" in loaded["layers"]
         assert loaded["layers"]["0"]["activation_counts"]["10"] == 20
         assert loaded["layers"]["5"]["activation_counts"]["3"] == 22
+
+
+class TestUpgradeFromProfile:
+    def _patch_fake_upgrade(self, monkeypatch, num_experts=8):
+        def fake_upgrade(model, model_path, capacity):
+            upgraded = 0
+            for layer in model.layers:
+                switch = layer.mlp.switch_mlp
+                gate = getattr(switch, "gate_proj", None)
+                if not isinstance(gate, CachedQuantizedSwitchLinear):
+                    continue
+                phase2_cache = gate._cache
+                sorted_ids = sorted(
+                    phase2_cache.entries.keys(),
+                    key=lambda eid: (-phase2_cache.frequency.get(eid, 0), eid),
+                )
+                cached_ids = sorted_ids[:capacity]
+                pred_cache = PredictiveExpertCache(capacity, num_experts)
+                for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                    pred_cache.weights[proj_name] = mx.zeros((capacity, 1, 1))
+                    pred_cache.scales[proj_name] = mx.zeros((capacity, 1, 1))
+                    pred_cache.biases[proj_name] = None
+                pred_cache.build_lookup(cached_ids)
+                for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                    phase2 = getattr(switch, proj_name)
+                    setattr(
+                        switch,
+                        proj_name,
+                        PredictiveCachedSwitchLinear(
+                            group_size=phase2.group_size,
+                            bits=phase2.bits,
+                            mode=phase2.mode,
+                            proj_name=proj_name,
+                            cache=pred_cache,
+                        ),
+                    )
+                    upgraded += 1
+            return upgraded
+
+        monkeypatch.setattr(
+            "mlx_moe.lazy_experts.persistence.upgrade_to_predictive",
+            fake_upgrade,
+        )
+
+    def test_pin_top_k_zero_disables_pinning(self, monkeypatch):
+        self._patch_fake_upgrade(monkeypatch)
+        model = _make_model_with_phase2_cache(n_layers=1, capacity=4, num_experts=8)
+        profile = {
+            "num_prompts": 10,
+            "layers": {
+                "0": {
+                    "activation_counts": {
+                        "0": 10,
+                        "1": 9,
+                        "2": 8,
+                        "3": 7,
+                        "4": 6,
+                    }
+                }
+            },
+        }
+
+        upgraded = upgrade_from_profile(
+            model, model_path=".", capacity=4, profile=profile, pin_top_k=0
+        )
+        assert upgraded == 3
+        cache = model.layers[0].mlp.switch_mlp.gate_proj._cache
+        assert cache.pinned_set == set()
+
+    def test_pin_top_k_selects_most_frequent(self, monkeypatch):
+        self._patch_fake_upgrade(monkeypatch)
+        model = _make_model_with_phase2_cache(n_layers=1, capacity=4, num_experts=8)
+        profile = {
+            "num_prompts": 10,
+            "layers": {
+                "0": {
+                    "activation_counts": {
+                        "4": 5,
+                        "1": 9,
+                        "0": 10,
+                        "3": 6,
+                        "2": 7,
+                    }
+                }
+            },
+        }
+
+        upgraded = upgrade_from_profile(
+            model, model_path=".", capacity=4, profile=profile, pin_top_k=2
+        )
+        assert upgraded == 3
+        cache = model.layers[0].mlp.switch_mlp.gate_proj._cache
+        assert cache.pinned_set == {0, 1}
+
+    def test_pin_top_k_negative_rejected(self, monkeypatch):
+        self._patch_fake_upgrade(monkeypatch)
+        model = _make_model_with_phase2_cache(n_layers=1, capacity=4, num_experts=8)
+        profile = {"num_prompts": 10, "layers": {"0": {"activation_counts": {"0": 10}}}}
+        with pytest.raises(ValueError, match="pin_top_k must be >= 0"):
+            upgrade_from_profile(
+                model, model_path=".", capacity=4, profile=profile, pin_top_k=-1
+            )
 
 
 # --- SafetensorsMap ---

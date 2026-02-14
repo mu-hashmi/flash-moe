@@ -340,8 +340,14 @@ def load_universal_profile(path: str | Path) -> dict:
         return json.load(f)
 
 
-def upgrade_from_profile(model, model_path: str | Path, capacity: int,
-                         profile: dict, pin_threshold: float = 0.5) -> int:
+def upgrade_from_profile(
+    model,
+    model_path: str | Path,
+    capacity: int,
+    profile: dict,
+    pin_threshold: float = 0.5,
+    pin_top_k: int | None = None,
+) -> int:
     """Profile-based cold start: skip discovery, use profile's top experts directly.
 
     When a universal expert profile exists, populates Phase 2 caches from the
@@ -356,11 +362,17 @@ def upgrade_from_profile(model, model_path: str | Path, capacity: int,
         model_path: Path to the model directory containing safetensors shards.
         capacity: Number of experts per layer.
         profile: Dict from load_universal_profile().
-        pin_threshold: Minimum activation fraction to consider an expert universal.
+        pin_threshold: Minimum activation fraction to consider an expert universal
+            when pin_top_k is None.
+        pin_top_k: If set, pin exactly top-K activation-count experts per layer
+            (after intersecting with cached experts). Use 0 for no pinning.
 
     Returns:
         Number of modules upgraded.
     """
+    if pin_top_k is not None and pin_top_k < 0:
+        raise ValueError(f"pin_top_k must be >= 0, got {pin_top_k}")
+
     model_path = Path(model_path)
     num_prompts = profile["num_prompts"]
     min_count = int(pin_threshold * num_prompts)
@@ -382,8 +394,7 @@ def upgrade_from_profile(model, model_path: str | Path, capacity: int,
         counts = layer_data.get("activation_counts", {})
         sorted_experts = sorted(
             ((int(eid), int(cnt)) for eid, cnt in counts.items()),
-            key=lambda x: x[1],
-            reverse=True,
+            key=lambda x: (-x[1], x[0]),
         )
 
         cache = proj._cache
@@ -410,10 +421,19 @@ def upgrade_from_profile(model, model_path: str | Path, capacity: int,
             continue
 
         counts = layer_data.get("activation_counts", {})
-        pinned = set(
-            int(eid) for eid, cnt in counts.items()
-            if int(cnt) >= min_count
-        )
+        if pin_top_k is None:
+            pinned = set(
+                int(eid) for eid, cnt in counts.items()
+                if int(cnt) >= min_count
+            )
+        elif pin_top_k == 0:
+            pinned = set()
+        else:
+            sorted_experts = sorted(
+                ((int(eid), int(cnt)) for eid, cnt in counts.items()),
+                key=lambda x: (-x[1], x[0]),
+            )
+            pinned = {eid for eid, _ in sorted_experts[:pin_top_k]}
         proj._cache.pinned_set = pinned & proj._cache.cached_set
 
     return upgraded

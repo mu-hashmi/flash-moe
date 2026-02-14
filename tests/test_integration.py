@@ -2,6 +2,7 @@
 
 import json
 import math
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -568,7 +569,7 @@ class TestServerEndpoints:
         from mlx_moe.server import _sampling_kwargs
 
         kwargs = _sampling_kwargs({}, "mlx-community/Qwen3-Coder-Next-4bit")
-        assert kwargs == {"temp": 1.0, "top_p": 0.95, "top_k": 40}
+        assert kwargs == {"temp": 0.2, "top_p": 0.95, "top_k": 40}
 
     def test_sampling_kwargs_client_overrides_defaults(self):
         from mlx_moe.server import _sampling_kwargs
@@ -584,11 +585,110 @@ class TestServerEndpoints:
         text = "<think>internal reasoning</think>The answer is 42."
         assert _strip_thinking(text) == "The answer is 42."
 
+    def test_filter_thinking_piece_balanced(self):
+        from mlx_moe.server import _filter_thinking_piece
+
+        text, state = _filter_thinking_piece(
+            "A<think>hidden</think>B", False, "<think>", "</think>"
+        )
+        assert text == "AB"
+        assert state is False
+
+    def test_filter_thinking_piece_unclosed(self):
+        from mlx_moe.server import _filter_thinking_piece
+
+        text, state = _filter_thinking_piece(
+            "A<think>hidden", False, "<think>", "</think>"
+        )
+        assert text == "A"
+        assert state is True
+
     def test_strip_thinking_no_tags(self):
         from mlx_moe.server import _strip_thinking
 
         text = "No thinking here."
         assert _strip_thinking(text) == "No thinking here."
+
+    def test_find_profile_prefers_toolchat(self, tmp_path):
+        from mlx_moe.server import _find_profile
+
+        (tmp_path / "qwen3-coder-next.json").write_text("{}")
+        toolchat = tmp_path / "qwen3-coder-next-toolchat.json"
+        toolchat.write_text("{}")
+
+        result = _find_profile(
+            "mlx-community/Qwen3-Coder-Next-4bit",
+            profiles_dir=tmp_path,
+        )
+        assert result == str(toolchat)
+
+    def test_find_profile_falls_back_to_base(self, tmp_path):
+        from mlx_moe.server import _find_profile
+
+        base = tmp_path / "qwen3-coder-next.json"
+        base.write_text("{}")
+
+        result = _find_profile(
+            "mlx-community/Qwen3-Coder-Next-4bit",
+            profiles_dir=tmp_path,
+        )
+        assert result == str(base)
+
+    def test_cache_key_default(self, server):
+        assert server._cache_key_from_body({}) == "default"
+
+    def test_cache_key_priority(self, server):
+        body = {
+            "cache_key": "k1",
+            "session_id": "s1",
+            "metadata": {"cache_key": "k2", "session_id": "s2"},
+            "user": "u1",
+        }
+        assert server._cache_key_from_body(body) == "k1"
+
+    def test_cache_key_lru_eviction(self):
+        from mlx_moe.server import Server
+
+        srv = Server("test-model/fake", kv_cache_slots=2)
+        srv._put_kv_cache("a", [1], object())
+        srv._put_kv_cache("b", [2], object())
+        srv._put_kv_cache("c", [3], object())
+
+        assert "a" not in srv._kv_cache
+        assert "b" in srv._kv_cache
+        assert "c" in srv._kv_cache
+
+    def test_server_load_passes_pin_top_k(self, monkeypatch):
+        import importlib
+        from mlx_moe.server import Server
+
+        generate_mod = importlib.import_module("mlx_moe.lazy_experts.generate")
+        captured = {}
+
+        def fake_startup(model_name, prompt, **kwargs):
+            captured.update(kwargs)
+            return object(), SimpleNamespace(has_chat_template=False), "."
+
+        monkeypatch.setattr(generate_mod, "_startup", fake_startup)
+
+        srv = Server("test-model/fake", pin_top_k=32, warmup="none")
+        srv.load()
+
+        assert captured["pin_top_k"] == 32
+
+    def test_dynamic_update_policy_high_fallback_aggressive(self, server):
+        interval, budget = server._dynamic_update_policy(
+            60, last_fallback_rate=0.4, no_swap_streak=0, low_fallback_streak=0
+        )
+        assert interval == 1
+        assert budget >= 32
+
+    def test_dynamic_update_policy_backoff_low_fallback(self, server):
+        interval, budget = server._dynamic_update_policy(
+            120, last_fallback_rate=0.04, no_swap_streak=5, low_fallback_streak=12
+        )
+        assert interval >= 20
+        assert budget == 8
 
     def test_check_input_length_ok(self, server):
         assert server._check_input_length(500) is None
