@@ -609,30 +609,26 @@ class TestServerEndpoints:
         text = "No thinking here."
         assert _strip_thinking(text) == "No thinking here."
 
-    def test_find_profile_prefers_toolchat(self, tmp_path):
+    def test_find_profile_uses_exact_model_slug(self, tmp_path):
         from mlx_moe.server import _find_profile
 
-        (tmp_path / "qwen3-coder-next.json").write_text("{}")
-        toolchat = tmp_path / "qwen3-coder-next-toolchat.json"
-        toolchat.write_text("{}")
+        exact = tmp_path / "qwen3-coder-next-4bit.json"
+        exact.write_text("{}")
 
         result = _find_profile(
             "mlx-community/Qwen3-Coder-Next-4bit",
             profiles_dir=tmp_path,
         )
-        assert result == str(toolchat)
+        assert result == str(exact)
 
-    def test_find_profile_falls_back_to_base(self, tmp_path):
+    def test_find_profile_returns_none_when_exact_profile_missing(self, tmp_path):
         from mlx_moe.server import _find_profile
-
-        base = tmp_path / "qwen3-coder-next.json"
-        base.write_text("{}")
 
         result = _find_profile(
             "mlx-community/Qwen3-Coder-Next-4bit",
             profiles_dir=tmp_path,
         )
-        assert result == str(base)
+        assert result is None
 
     def test_cache_key_default(self, server):
         assert server._cache_key_from_body({}) == "default"

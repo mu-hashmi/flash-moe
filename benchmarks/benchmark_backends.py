@@ -36,8 +36,8 @@ Methodology implemented by this script:
    - reuse-minus-cold deltas
 
 Outputs:
-- `benchmarks/results/backend_compare_<timestamp>.json`
-- `benchmarks/results/backend_compare_<timestamp>.md`
+- `logs/backends/backend_compare_<timestamp>.json`
+- `logs/backends/backend_compare_<timestamp>.md`
 - backend server logs alongside the result files
 
 Run examples:
@@ -71,7 +71,7 @@ from typing import Any
 import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
+RESULTS_DIR = REPO_ROOT / "logs" / "backends"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 SYSTEM_LINE = (

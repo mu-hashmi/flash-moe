@@ -32,6 +32,8 @@ DEFAULT_PORT_BASE = 8081
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_REQUEST_TIMEOUT_S = 180
 DEFAULT_STARTUP_TIMEOUT_S = 240
+DEFAULT_OUTPUT_DIR = "logs"
+DEFAULT_PROFILES_DIR = "profiles"
 
 TELEMETRY_RE = re.compile(
     r"\[telemetry\].*prefill=([0-9.]+)ms ttft=([0-9.]+)ms "
@@ -55,6 +57,28 @@ CODING_EVAL_PROMPTS = [
     "Patch CLI to add one new flag and add tests for it.",
     "Read failing integration output and propose the smallest safe patch.",
 ]
+
+
+class RunLogger:
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._handle = path.open("w", encoding="utf-8")
+
+    def write_line(self, line: str) -> None:
+        with self._lock:
+            self._handle.write(line + "\n")
+            self._handle.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._handle.close()
+
+
+def _print_line(line: str, run_logger: RunLogger | None = None) -> None:
+    print(line)
+    if run_logger is not None:
+        run_logger.write_line(line)
 
 
 def _parse_mix_list(spec: str) -> list[tuple[int, int]]:
@@ -165,10 +189,17 @@ def _build_eval_requests(
     return requests_data
 
 
-def _read_lines(proc: subprocess.Popen, sink: list[str]) -> None:
+def _read_lines(
+    proc: subprocess.Popen,
+    sink: list[str],
+    run_logger: RunLogger | None = None,
+) -> None:
     assert proc.stdout is not None
     for line in proc.stdout:
-        sink.append(line.rstrip("\n"))
+        stripped = line.rstrip("\n")
+        sink.append(stripped)
+        if run_logger is not None:
+            run_logger.write_line(stripped)
         print(line, end="")
 
 
@@ -180,11 +211,12 @@ def _start_server(
     port: int,
     warmup: str,
     startup_timeout_s: int,
+    run_logger: RunLogger | None = None,
 ) -> tuple[subprocess.Popen, list[str], threading.Thread]:
     cmd = [
         sys.executable,
-        "-m",
-        "mlx_moe.cli",
+        "-c",
+        "from mlx_moe.cli import main; main()",
         "serve",
         model_name,
         "--host",
@@ -208,7 +240,11 @@ def _start_server(
         bufsize=1,
     )
     lines: list[str] = []
-    reader = threading.Thread(target=_read_lines, args=(proc, lines), daemon=True)
+    reader = threading.Thread(
+        target=_read_lines,
+        args=(proc, lines, run_logger),
+        daemon=True,
+    )
     reader.start()
 
     deadline = time.time() + startup_timeout_s
@@ -404,6 +440,7 @@ def _run_candidate(
     request_timeout_s: int,
     startup_timeout_s: int,
     run_label: str,
+    run_logger: RunLogger | None = None,
 ) -> dict:
     _clear_model_cache(model_name)
     proc, lines, reader = _start_server(
@@ -414,6 +451,7 @@ def _run_candidate(
         port=port,
         warmup=warmup,
         startup_timeout_s=startup_timeout_s,
+        run_logger=run_logger,
     )
     valid_tool_calls = 0
     total_tool_calls = 0
@@ -477,6 +515,7 @@ def _generate_profile(
     num_prompts: int,
     seed: int,
     output_path: Path,
+    run_logger: RunLogger | None = None,
 ) -> None:
     cmd = [
         sys.executable,
@@ -500,8 +539,23 @@ def _generate_profile(
         "--output",
         str(output_path),
     ]
-    print(f"\n[profile] generating {output_path.name} ...")
-    subprocess.run(cmd, check=True)
+    _print_line(f"\n[profile] generating {output_path.name} ...", run_logger)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        stripped = line.rstrip("\n")
+        if run_logger is not None:
+            run_logger.write_line(stripped)
+        print(line, end="")
+    ret = proc.wait()
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, cmd)
 
 
 def _aggregate_runs(runs: list[dict]) -> dict:
@@ -583,119 +637,134 @@ def main() -> None:
     parser.add_argument("--request-timeout-s", type=int, default=DEFAULT_REQUEST_TIMEOUT_S)
     parser.add_argument("--startup-timeout-s", type=int, default=DEFAULT_STARTUP_TIMEOUT_S)
     parser.add_argument("--port-base", type=int, default=DEFAULT_PORT_BASE)
-    parser.add_argument("--output-dir", default="benchmarks/results")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--profiles-dir", default=DEFAULT_PROFILES_DIR)
     args = parser.parse_args()
 
     mixes = _parse_mix_list(args.mixes)
     pin_counts = _parse_int_list(args.pin_counts)
     output_dir = Path(args.output_dir)
+    profiles_dir = Path(args.profiles_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    profiles_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = output_dir / f"pin_sweep_{ts}.log"
+    run_logger = RunLogger(log_path)
 
-    profiles: dict[tuple[int, int], Path] = {}
-    for idx, (coding, toolchat) in enumerate(mixes):
-        profile_path = output_dir / _profile_filename(args.model, coding, toolchat)
-        _generate_profile(
-            model_name=args.model,
-            capacity=args.capacity,
-            threshold=args.threshold,
-            coding=coding,
-            toolchat=toolchat,
-            num_prompts=args.profile_prompts,
-            seed=args.seed + idx,
-            output_path=profile_path,
-        )
-        profiles[(coding, toolchat)] = profile_path
+    try:
+        profiles: dict[tuple[int, int], Path] = {}
+        for idx, (coding, toolchat) in enumerate(mixes):
+            profile_path = profiles_dir / _profile_filename(args.model, coding, toolchat)
+            _generate_profile(
+                model_name=args.model,
+                capacity=args.capacity,
+                threshold=args.threshold,
+                coding=coding,
+                toolchat=toolchat,
+                num_prompts=args.profile_prompts,
+                seed=args.seed + idx,
+                output_path=profile_path,
+                run_logger=run_logger,
+            )
+            profiles[(coding, toolchat)] = profile_path
 
-    results = {
-        "timestamp": ts,
-        "model": args.model,
-        "capacity": args.capacity,
-        "threshold": args.threshold,
-        "mixes": mixes,
-        "pin_counts": pin_counts,
-        "repeats": args.repeats,
-        "profile_prompts": args.profile_prompts,
-        "eval_requests": args.eval_requests,
-        "gate": STRICT_GATE,
-        "candidates": [],
-    }
+        results = {
+            "timestamp": ts,
+            "model": args.model,
+            "capacity": args.capacity,
+            "threshold": args.threshold,
+            "mixes": mixes,
+            "pin_counts": pin_counts,
+            "repeats": args.repeats,
+            "profile_prompts": args.profile_prompts,
+            "eval_requests": args.eval_requests,
+            "gate": STRICT_GATE,
+            "profiles_dir": str(profiles_dir),
+            "log_path": str(log_path),
+            "candidates": [],
+        }
 
-    port = args.port_base
-    for mix_idx, (coding, toolchat) in enumerate(mixes):
-        profile_path = profiles[(coding, toolchat)]
-        mix_label = f"{coding}/{toolchat}"
-        requests_data = _build_eval_requests(
-            coding_weight=coding,
-            tool_weight=toolchat,
-            n_requests=args.eval_requests,
-            seed=args.seed + 1000 + mix_idx,
-            max_tokens=args.max_tokens,
-        )
-        for pin_top_k in pin_counts:
-            run_metrics = []
-            for rep in range(args.repeats):
-                run_label = f"mix-{coding}-{toolchat}-k-{pin_top_k}-r-{rep}"
-                print(
-                    f"\n[sweep] mix={mix_label} pin_top_k={pin_top_k} repeat={rep + 1}/{args.repeats} "
-                    f"port={port}"
-                )
-                metrics = _run_candidate(
-                    model_name=args.model,
-                    profile_path=profile_path,
-                    pin_top_k=pin_top_k,
-                    capacity=args.capacity,
-                    warmup=args.warmup,
-                    port=port,
-                    requests_data=requests_data,
-                    request_timeout_s=args.request_timeout_s,
-                    startup_timeout_s=args.startup_timeout_s,
-                    run_label=run_label,
-                )
-                run_metrics.append(metrics)
-                port += 1
+        port = args.port_base
+        for mix_idx, (coding, toolchat) in enumerate(mixes):
+            profile_path = profiles[(coding, toolchat)]
+            mix_label = f"{coding}/{toolchat}"
+            requests_data = _build_eval_requests(
+                coding_weight=coding,
+                tool_weight=toolchat,
+                n_requests=args.eval_requests,
+                seed=args.seed + 1000 + mix_idx,
+                max_tokens=args.max_tokens,
+            )
+            for pin_top_k in pin_counts:
+                run_metrics = []
+                for rep in range(args.repeats):
+                    run_label = f"mix-{coding}-{toolchat}-k-{pin_top_k}-r-{rep}"
+                    _print_line(
+                        f"\n[sweep] mix={mix_label} pin_top_k={pin_top_k} repeat={rep + 1}/{args.repeats} "
+                        f"port={port}",
+                        run_logger,
+                    )
+                    metrics = _run_candidate(
+                        model_name=args.model,
+                        profile_path=profile_path,
+                        pin_top_k=pin_top_k,
+                        capacity=args.capacity,
+                        warmup=args.warmup,
+                        port=port,
+                        requests_data=requests_data,
+                        request_timeout_s=args.request_timeout_s,
+                        startup_timeout_s=args.startup_timeout_s,
+                        run_label=run_label,
+                        run_logger=run_logger,
+                    )
+                    run_metrics.append(metrics)
+                    port += 1
 
-            aggregated = _aggregate_runs(run_metrics)
-            candidate = {
-                "mix": [coding, toolchat],
-                "mix_label": mix_label,
-                "profile_path": str(profile_path),
-                "pin_top_k": pin_top_k,
-                "metrics": aggregated,
-            }
-            candidate["pass_gate"] = _passes_gate(aggregated)
-            results["candidates"].append(candidate)
+                aggregated = _aggregate_runs(run_metrics)
+                candidate = {
+                    "mix": [coding, toolchat],
+                    "mix_label": mix_label,
+                    "profile_path": str(profile_path),
+                    "pin_top_k": pin_top_k,
+                    "metrics": aggregated,
+                }
+                candidate["pass_gate"] = _passes_gate(aggregated)
+                results["candidates"].append(candidate)
 
-    passing = [c for c in results["candidates"] if c["pass_gate"]]
-    winner = None
-    if passing:
-        winner = max(
-            passing,
-            key=lambda c: (
-                c["metrics"]["decode_tps_mean"],
-                -c["metrics"]["fallback_rate_pct_mean"],
-                -c["metrics"]["ttft_ms_mean"],
-            ),
-        )
-        results["winner"] = winner
-    else:
-        results["winner"] = None
+        passing = [c for c in results["candidates"] if c["pass_gate"]]
+        winner = None
+        if passing:
+            winner = max(
+                passing,
+                key=lambda c: (
+                    c["metrics"]["decode_tps_mean"],
+                    -c["metrics"]["fallback_rate_pct_mean"],
+                    -c["metrics"]["ttft_ms_mean"],
+                ),
+            )
+            results["winner"] = winner
+        else:
+            results["winner"] = None
 
-    json_path = output_dir / f"pin_sweep_{ts}.json"
-    md_path = output_dir / f"pin_sweep_summary_{ts}.md"
-    json_path.write_text(json.dumps(results, indent=2))
-    _write_summary_md(md_path, results["candidates"], winner)
-    print(f"\nResults JSON: {json_path}")
-    print(f"Summary MD:   {md_path}")
-    if winner is None:
-        print("No candidate passed strict quality gate.")
-    else:
-        print(
-            "Winner: "
-            f"mix={winner['mix_label']} pin_top_k={winner['pin_top_k']} "
-            f"decode={winner['metrics']['decode_tps_mean']:.2f} tok/s "
-            f"fallback={winner['metrics']['fallback_rate_pct_mean']:.2f}%"
-        )
+        json_path = output_dir / f"pin_sweep_{ts}.json"
+        md_path = output_dir / f"pin_sweep_summary_{ts}.md"
+        json_path.write_text(json.dumps(results, indent=2))
+        _write_summary_md(md_path, results["candidates"], winner)
+        _print_line(f"\nResults JSON: {json_path}", run_logger)
+        _print_line(f"Summary MD:   {md_path}", run_logger)
+        _print_line(f"Run log:      {log_path}", run_logger)
+        if winner is None:
+            _print_line("No candidate passed strict quality gate.", run_logger)
+        else:
+            _print_line(
+                "Winner: "
+                f"mix={winner['mix_label']} pin_top_k={winner['pin_top_k']} "
+                f"decode={winner['metrics']['decode_tps_mean']:.2f} tok/s "
+                f"fallback={winner['metrics']['fallback_rate_pct_mean']:.2f}%",
+                run_logger,
+            )
+    finally:
+        run_logger.close()
 
 
 if __name__ == "__main__":

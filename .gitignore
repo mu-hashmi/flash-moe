@@ -11,3 +11,7 @@ wheels/
 
 # Skill files (local Claude Code config)
 *.skill
+
+# Local benchmark outputs
+/logs/
+/benchmarks/results/

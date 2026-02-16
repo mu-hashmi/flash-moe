@@ -28,13 +28,10 @@ def _find_profile(model_name: str, profiles_dir: Path | None = None) -> str | No
         profiles_dir = Path(__file__).parent.parent / "profiles"
     if not profiles_dir.is_dir():
         return None
-    slug = model_name.split("/")[-1].lower()
-    for suffix in ("-4bit", "-8bit", "-bf16", "-fp16"):
-        slug = slug.removesuffix(suffix)
-    for stem in (f"{slug}-toolchat", slug):
-        candidate = profiles_dir / f"{stem}.json"
-        if candidate.is_file():
-            return str(candidate)
+    model_slug = model_name.split("/")[-1].lower()
+    candidate = profiles_dir / f"{model_slug}.json"
+    if candidate.is_file():
+        return str(candidate)
     return None
 
 

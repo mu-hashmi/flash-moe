@@ -13,8 +13,8 @@ def main():
     serve.add_argument("--capacity", type=int, default=None,
                        help="Experts cached per MoE layer (auto-selected if omitted)")
     serve.add_argument("--profile", default=None, help="Path to expert profile JSON")
-    serve.add_argument("--pin-top-k", type=int, default=None,
-                       help="Pin top-K profile experts per layer (0 disables pinning).")
+    serve.add_argument("--pin-top-k", type=int, default=32,
+                       help="Pin top-K profile experts per layer (default: 32, 0 disables pinning).")
     serve.add_argument("--max-tokens", type=int, default=4096,
                        help="Max output tokens per request (default: 4096)")
     serve.add_argument("--max-input-tokens", type=int, default=16384,

@@ -4,137 +4,213 @@ Instructions for coding agents working on this codebase.
 
 ## What This Project Is
 
-MLX-MoE enables large MoE models to run on memory-constrained Macs by loading only router-selected experts on demand from SSD. Runs Qwen3-Coder-Next-4bit (46 GB full, 512 experts/layer) on a 32 GB Mac at 23 tok/s using 19 GB.
+MLX-MoE runs large MoE models on memory-constrained Macs by loading only routed experts from SSD into Metal memory. The primary target is `mlx-community/Qwen3-Coder-Next-4bit` (512 experts/layer, 48 MoE layers).
 
 ## Project Structure
 
+```text
+mlx_moe/                      # Package
+  __init__.py                 # Exports: generate, stream_generate, Session
+  cli.py                      # CLI entrypoint: mlx-moe serve
+  server.py                   # OpenAI + Anthropic API server
+  lazy_experts/
+    core.py                   # enable/upgrade/reset, cache stats, dynamic updates
+    modules.py                # Lazy/Cached/Predictive switch modules + caches
+    loading.py                # Capacity selection, shard maps, selective loading
+    discovery.py              # Router-only discovery
+    warmup.py                 # Delta warmup and warmup helpers
+    persistence.py            # Cache state, profiles, prepacked weights
+    generate.py               # generate, stream_generate, Session, _startup
+
+benchmarks/
+  test_model.py               # Quick local smoke run (throughput + fallback)
+  validate_quality.py         # Quality/warmup/memory/adaptive experiments
+  profile_experts.py          # Build expert profiles (diverse/coding/tool-chat/mixed)
+  benchmark_mlx_server.py     # mlx-moe-only server benchmark with streamed output
+  benchmark_backends.py       # llama.cpp vs mlx-moe comparison (optional)
+  sweep_profile_pinning.py    # Mix/pin sweep using real tool-chat traffic
+  tool_chat_scenarios.py      # Tool schemas + agentic prompt scenarios
+
+tests/
+  test_unit_core.py
+  test_unit_persistence.py
+  test_integration.py         # Synthetic MoE + server endpoint tests
+
+profiles/                     # Checked-in profile JSONs
+logs/                         # Local benchmark/sweep outputs (gitignored)
+docs/architecture.md          # Deep architecture notes
 ```
-mlx_moe/                    # The package (pip-installable)
-  __init__.py               # Exports: generate, stream_generate, Session
-  lazy_experts/             # Core implementation
-    core.py                 # enable/upgrade/reset, cache stats, skip-fallback
-    modules.py              # ExpertCache, Lazy/Cached/Predictive module classes
-    loading.py              # Weight loading, shard maps, capacity selection
-    discovery.py            # Router-only discovery, speculative probes
-    warmup.py               # Delta warmup, incremental warmup
-    persistence.py          # Cache state save/load, prepacked weights, profiles
-    generate.py             # generate, stream_generate, Session, _startup
 
-  cli.py                    # CLI entry point: mlx-moe serve
-  server.py                 # OpenAI + Anthropic API server (Starlette + uvicorn)
-
-tests/                      # Automated test suite (uv run pytest)
-  test_unit_core.py         # ExpertCache, PredictiveExpertCache, select_capacity, module detection
-  test_unit_persistence.py  # save/load roundtrips, SafetensorsMap
-  test_integration.py       # Synthetic 8-expert model pipeline, server endpoints
-
-benchmarks/                 # Performance benchmarks and smoke tests (run manually)
-profiles/                   # Pre-computed expert profiles (auto-detected by model name)
-```
-
-Depends on stock `mlx-lm >= 0.30.0` — no fork needed. Uses `mlx-lm` for model loading (`mlx_lm.load`), generation (`mlx_lm.generate`, `mlx_lm.stream_generate`), and the `QuantizedSwitchLinear` base class.
+Depends on stock `mlx-lm >= 0.30.0` (no fork).
 
 ## Dev Setup
 
-This is a uv project. Python 3.13.
+This is a uv project (`pyproject.toml`, Python 3.13).
 
 ```bash
 uv sync
-uv run pytest                # 100 tests, ~0.5s
 uv run python -c "from mlx_moe import generate; print('ok')"
+uv run pytest
 ```
 
-## Testing
+## Testing and Benchmarks
+
+Core tests:
 
 ```bash
-uv run pytest                # unit + integration tests (no model download needed)
-uv run pytest -v             # verbose output
+uv run pytest
+```
 
-# Smoke tests against real models (manual, takes minutes)
+Quick model smoke checks:
+
+```bash
 uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit
 uv run python benchmarks/test_model.py mlx-community/Qwen3-Coder-Next-4bit --capacity 208 --tokens 50
 ```
 
+Validation suite (`validate_quality.py` uses positional experiment name):
+
+```bash
+uv run python benchmarks/validate_quality.py quality
+uv run python benchmarks/validate_quality.py warmup
+uv run python benchmarks/validate_quality.py memory
+uv run python benchmarks/validate_quality.py memory-predictive
+uv run python benchmarks/validate_quality.py delta-warmup
+uv run python benchmarks/validate_quality.py adaptive
+uv run python benchmarks/validate_quality.py expert-size
+```
+
+Profile generation:
+
+```bash
+uv run python benchmarks/profile_experts.py --model mlx-community/Qwen3-Coder-Next-4bit --prompts mixed --coding-weight 70 --toolchat-weight 30
+```
+
+mlx-moe-only server benchmark with live output:
+
+```bash
+uv run python benchmarks/benchmark_mlx_server.py \
+  --model mlx-community/Qwen3-Coder-Next-4bit \
+  --profile profiles/qwen3-coder-next-4bit.json \
+  --capacity 208 --pin-top-k 32 --tools-mode field
+```
+
+This writes timestamped artifacts under:
+
+```text
+logs/model/<model_slug>/<profile_slug>/<datetime>/
+  benchmark.json
+  benchmark.md
+  server.log
+```
+
+Pinning sweep (long-running):
+
+```bash
+uv run python benchmarks/sweep_profile_pinning.py
+```
+
+Cross-backend comparison (`benchmark_backends.py`) is optional and requires working llama.cpp.
+
 ## Architecture
 
-### How It Works
+### Startup Pipeline
 
-1. `enable_lazy_experts(model, model_path, capacity)` replaces `QuantizedSwitchLinear` modules with lazy-loading versions
-2. `mx.eval(model.parameters())` loads only non-expert weights (~1.4 GB)
-3. Expert warmup via router-only discovery (~1s) or pre-computed profile (0s)
-4. `upgrade_to_predictive()` loads top experts into GPU-resident stacked tensors
-5. Generation uses zero-eval forward pass with pre-stacked expert lookup tables
+`_startup()` in `mlx_moe/lazy_experts/generate.py` performs:
+
+1. Load model lazy (`mlx_lm.load(..., lazy=True)`), detect MoE structure.
+2. Auto-select capacity if omitted (`select_capacity` against Metal recommended working set).
+3. Replace SwitchLinear modules with predictive-capable lazy modules.
+4. Materialize non-expert weights (`mx.eval(model.parameters())`).
+5. Build shard maps + `SafetensorsMap`.
+6. Startup path (in order):
+   - Prepacked weights (`*.weights.safetensors`) if present.
+   - Cache-state upgrade (`*.json`) if present.
+   - Else one of:
+     - `warmup=full`: LCP warmup + predictive upgrade
+     - profile-based upgrade (`--profile`)
+     - router-only discovery + upgrade
+7. Optional hybrid refinement (`warmup=hybrid`, only on fresh startup path).
+8. Save cache state / prepacked snapshot if newly built.
+9. Enable skip-fallback mode.
+10. Apply `mx.set_wired_limit(...)` after expert loading completes.
 
 ### Module Replacement Chain
 
-`QuantizedSwitchLinear` (stock mlx-lm) → `LazyQuantizedSwitchLinear` (lazy-loads from SSD on cache miss) → `PredictiveCachedSwitchLinear` (pre-stacked weight tensors, zero mx.eval() in forward pass). The final form uses `gather_qmm` with a remap table to dispatch to cached experts by index.
+`QuantizedSwitchLinear` -> `LazyQuantizedSwitchLinear` -> `CachedQuantizedSwitchLinear` -> `PredictiveCachedSwitchLinear`
 
-### MoE Block Structure (Qwen3-Coder)
-
-Each MoE layer contains:
-
-- **Router (gate)**: selects top-k expert indices per token
-- **SwitchGLU**: 3 `QuantizedSwitchLinear` projections (gate/up/down), each containing all 512 experts
-- **Shared expert**: always active on every token, never offloaded — critical for quality at low capacity
-
-`capacity=208` means 208/512 expert slices loaded per projection. 48 layers × 3 projections = 144 modules replaced.
+Final dispatch is zero-eval via pre-stacked tensors and lookup remap (`gather_qmm` path).
 
 ### Dynamic Cache Updates
 
-`dynamic_cache_update()` (core.py) runs between tokens during generation, swapping in actually-needed experts to replace profile-predicted ones that aren't being used. Called in the server's `_stream()` loop — aggressively during the first 10 tokens, tapering off after 30. This is how expert coverage converges to near-0% fallback even when the profile doesn't perfectly match the prompt domain.
+`dynamic_cache_update()` runs between tokens and is invoked in server `_stream()` with adaptive interval/budget policy. Telemetry includes:
+
+- `prefill`
+- `ttft`
+- `decode tok/s`
+- `dcu_calls`
+- `swaps`
+- `fallback_rate`
 
 ### Wired Memory
 
-`mx.set_wired_limit()` after startup pins the ~19 GB working set in a Metal `MTLResidencySet`. Without this, macOS evicts Metal buffers to SSD when total memory exceeds `recommendedMaxWorkingSetSize` (~75% of RAM), causing page faults during generation. Measured improvement: 15.9 → 23.4 tok/s (+47% combined with cache_limit=256MB during warmup). Do not remove or reorder this — it must run after all expert loading is complete.
-
-### Auto Capacity Selection
-
-`select_capacity()` uses Metal's `max_recommended_working_set_size` (hardware-reported, not a percentage of system RAM) to pick the right number of experts. Targets 71% of the recommended limit, leaving headroom for KV cache growth. Expert slot sizes include weight + scales + biases (all quantization metadata). After upgrade, `mx.get_peak_memory()` is checked against `gc_limit` (0.95 × recommended) and warns if exceeded.
-
-### Supported Models
-
-Any MLX model using `SwitchGLU` with either module path:
-
-- `layer.mlp.switch_mlp` (Qwen, DeepSeek, GLM, Hunyuan, Jamba, OLMoE)
-- `layer.block_sparse_moe.switch_mlp` (Mixtral, PhiMoE, MiniMax, GraniteMoE)
+`mx.set_wired_limit()` is applied after startup to pin the working set in a Metal residency set. Keep this ordering; moving/removing it regresses throughput.
 
 ### Key Constraints
 
-- **Quality cliff at capacity < 192 for Qwen3-Coder (512 experts)** — garbled output regardless of warmup. Other models have different thresholds depending on expert count and top-k
-- **Metal pressure cliff at capacity > 208** on 32 GB Macs — 3x eval degradation. Cap 224 peaks at 26.4 GB during generation (scatter double-buffering)
-- **Never `mx.eval()` inside forward pass** — breaks async_eval pipeline (2.2x slowdown)
-- **Never cache `mx.load()` dicts** — lazy refs pin full tensors → OOM
-- **Eval per-layer during rebuilds** — deferred eval across 48 layers causes OOM
-- **MLX is NOT thread-safe** for GPU eval — cooperative single-thread only
-- Per-call `mx.load()` in warmup is intentional — fancy indexing materializes full source tensors, so fresh lazy refs each call prevents OOM
+- Capacity too low on Qwen3-Coder degrades quality sharply.
+- Capacity too high on 32 GB machines hits Metal pressure cliffs.
+- Do not call `mx.eval()` in predictive forward paths.
+- MLX GPU eval is not thread-safe; server serialization is intentional.
 
 ## API Server (`mlx-moe serve`)
 
 ```bash
-mlx-moe serve mlx-community/Qwen3-Coder-Next-4bit [--port 8080] [--host 127.0.0.1] [--capacity N] [--profile PATH] [--max-tokens N] [--max-input-tokens N] [--kv-bits N]
+mlx-moe serve MODEL \
+  [--host 127.0.0.1] [--port 8080] \
+  [--capacity N] [--profile PATH] [--pin-top-k N] \
+  [--max-tokens N] [--max-input-tokens N] \
+  [--kv-bits N] [--kv-cache-slots N] \
+  [--warmup hybrid|full|none] \
+  [--shutdown-timeout N]
 ```
 
-Endpoints: `/v1/chat/completions` (OpenAI), `/v1/messages` (Anthropic), `/v1/models`.
+Endpoints:
 
-Sampling parameters (`temperature`, `top_p`, `top_k`) are passed through from the request. Model-specific defaults in `MODEL_SAMPLING_DEFAULTS` (Qwen3-Coder: temp=1.0, top_p=0.95, top_k=40 per model card). Tool calls are parsed and converted between Anthropic and OpenAI formats. Truncated tool calls (hit token cap mid-generation) are salvage-parsed.
+- `POST /v1/chat/completions`
+- `POST /v1/messages`
+- `GET /v1/models`
 
-### Prompt Caching (KV Cache Reuse)
+Sampling:
 
-The server caches `_cached_tokens` + `_cached_kv` from the previous request. On each new request, `_stream()` finds the longest common token-ID prefix with the cached KV, trims the cache to the prefix length, and only prefills the new suffix. This drastically reduces TTFT for multi-turn/agentic conversations where successive requests share a long prefix (system prompt + tools + conversation history). The cache is invalidated before generation and restored on successful completion — a client disconnect mid-stream loses the cache.
+- Request fields `temperature`, `top_p`, `top_k` are passed through.
+- Default for Qwen3-Coder family is `temp=0.2`, `top_p=0.95`, `top_k=40`.
 
-### Hybrid Warmup
+Profile resolution:
 
-On the first request, the server runs a short coding prompt through the model (10 tokens). This serves two purposes: (1) confirms expert coverage from the profile, swapping in any missing experts via `dynamic_cache_update`, and (2) front-loads one-time costs — Metal shader compilation and faulting mmap'd prepacked weights into physical memory. Even with `warmup="none"`, these costs shift to the first user request. The warmup just ensures the user's first request isn't slow.
+- If `--profile` is omitted, server auto-detects from `profiles/`:
+  - `<model-slug>-toolchat.json`
+  - `<model-slug>.json`
 
-### Server limits
+KV cache behavior:
 
-- `--max-tokens` (default 4096) — max output tokens per request, caps KV cache growth
-- `--max-input-tokens` (default 16384) — rejects requests over this
-- Non-streaming responses capped at 512 output tokens to avoid blocking
+- Keyed LRU cache (`--kv-cache-slots`, default 1).
+- Reuse is based on longest common token prefix for each cache key.
+- Cache is invalidated before generation and restored only on successful completion.
+
+Hybrid startup refinement:
+
+- With `--warmup hybrid`, server load runs two short coding prompts and dynamic updates before `Ready.`.
+
+Limits:
+
+- `--max-input-tokens` rejects oversized requests.
+- `--max-tokens` caps request output.
+- Anthropic non-streaming responses are additionally capped to 512 output tokens.
 
 ## Code Style
 
-- No unnecessary comments. Comments explain WHY, not WHAT.
-- No defensive checks for impossible conditions.
-- No silent fallbacks. If something fails unexpectedly, crash loudly.
-- No backwards-compatibility shims for deleted code.
+- Comments explain why, not what.
+- No defensive checks for impossible states.
+- No silent fallbacks that hide failures.
+- Remove dead code paths cleanly; no compatibility shims for deleted behavior.

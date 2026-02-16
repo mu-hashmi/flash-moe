@@ -201,7 +201,7 @@ text = generate(
     "Your prompt",
     max_tokens=200,
     cache_dir="~/.cache/mlx-moe",                  # persist state between runs
-    profile_path="profiles/qwen3-coder-next.json",    # enable pinning
+    profile_path="profiles/qwen3-coder-next-4bit.json", # enable pinning
     kv_bits=8,                                        # quantize KV cache (optional)
 )
 ```
