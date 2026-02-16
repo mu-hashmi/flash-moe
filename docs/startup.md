@@ -1,6 +1,6 @@
 # Startup Architecture
 
-[Back to Architecture Overview](architecture.md)
+[Back to Architecture Overview](README.md)
 
 This page covers `_startup()` and cache materialization flow in `mlx_moe/lazy_experts/generate.py`.
 

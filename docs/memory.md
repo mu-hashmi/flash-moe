@@ -1,6 +1,6 @@
 # Memory and Capacity
 
-[Back to Architecture Overview](architecture.md)
+[Back to Architecture Overview](README.md)
 
 This page covers capacity math, working-set targeting, and runtime memory behavior.
 

@@ -38,7 +38,7 @@ tests/
 
 profiles/                     # Checked-in profile JSONs
 logs/                         # Local benchmark/sweep outputs (gitignored)
-docs/architecture.md          # Deep architecture notes
+docs/README.md                # High-level architecture overview
 ```
 
 Depends on stock `mlx-lm >= 0.30.0` (no fork).

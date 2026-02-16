@@ -1,6 +1,6 @@
 # Runtime Architecture
 
-[Back to Architecture Overview](architecture.md)
+[Back to Architecture Overview](README.md)
 
 This page covers predictive forward dispatch, skip-fallback behavior, and dynamic cache updates.
 

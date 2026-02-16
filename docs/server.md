@@ -1,6 +1,6 @@
 # Server Architecture
 
-[Back to Architecture Overview](architecture.md)
+[Back to Architecture Overview](README.md)
 
 This page covers `mlx_moe/server.py`: startup/refinement, request execution, KV reuse, and telemetry.
 
