@@ -73,6 +73,7 @@ def _startup(
 
     Returns (model, tokenizer, model_path) with all warmup/upgrade/wiring done.
     """
+    import mlx_lm as _mlx_lm
     from .core import upgrade_to_predictive
 
     t_total_start = time.perf_counter()

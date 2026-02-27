@@ -1,0 +1,139 @@
+{
+  "generated_at": "2026-02-27T20:29:25.572138+00:00",
+  "tokens_per_prompt": 200,
+  "prompts": [
+    {
+      "id": "code",
+      "text": "Write a Python implementation of an interval tree that supports insert, delete, and overlap queries. Include complexity analysis and one short usage example."
+    },
+    {
+      "id": "reasoning",
+      "text": "A vault has 5 locks and 8 keys. Exactly 5 keys open one lock each, and 3 are decoys. You can test one key on one lock per minute. Give a strategy that minimizes expected time to open all locks and explain why."
+    },
+    {
+      "id": "multilingual",
+      "text": "Explain in Spanish and Chinese how dynamic programming differs from greedy algorithms, and provide one example problem for each approach."
+    },
+    {
+      "id": "factual",
+      "text": "Give a concise timeline of major milestones in the development of modern transformer models from 2017 onward, with one sentence per milestone."
+    },
+    {
+      "id": "creative",
+      "text": "Write a short science-fiction scene where an engineer debugs a city-scale AI during a solar storm."
+    }
+  ],
+  "models": [
+    {
+      "id": "qwen3_coder_next",
+      "model": "mlx-community/Qwen3-Coder-Next-4bit",
+      "capacity": 208,
+      "native_scoring": true,
+      "preflight": {
+        "base_gb": 1.357549064,
+        "expert_gb": 17.666408448,
+        "predicted_gb": 19.023957512,
+        "budget_gb": 32.6417514496,
+        "effective_capacity": 208,
+        "moe_layers": 48,
+        "num_experts": 512
+      },
+      "prompt_results": [
+        {
+          "prompt_id": "code",
+          "prompt": "Write a Python implementation of an interval tree that supports insert, delete, and overlap queries. Include complexity analysis and one short usage example.",
+          "mlx_output_tokens": 200,
+          "mlx_decode_tps": 8.77858261718249,
+          "mlx_elapsed_s": 23.09576675000426,
+          "mlx_finish_reason": "length",
+          "mlx_output_preview": "Here's a complete Python implementation of an **Interval Tree** (specifically, an **Interval Tree** data structure, which is a type of augmented balanced binary search tree), supporting insert, delete, and overlap querie",
+          "mlx_mean_logprob": -0.46541471481323243,
+          "mlx_perplexity": 1.5926745576770038
+        },
+        {
+          "prompt_id": "reasoning",
+          "prompt": "A vault has 5 locks and 8 keys. Exactly 5 keys open one lock each, and 3 are decoys. You can test one key on one lock per minute. Give a strategy that minimizes expected time to open all locks and explain why.",
+          "mlx_output_tokens": 200,
+          "mlx_decode_tps": 11.047541232126852,
+          "mlx_elapsed_s": 18.513361667006393,
+          "mlx_finish_reason": "length",
+          "mlx_output_preview": "Let\u2019s carefully parse the problem.\n\n> A vault has 5 locks and 8 keys. Exactly 5 keys open one lock each, and 3 are decoys. You can test one key on one lock per minute. Give a strategy that minimizes expected time to open",
+          "mlx_mean_logprob": -0.25283159255981447,
+          "mlx_perplexity": 1.287666405970567
+        },
+        {
+          "prompt_id": "multilingual",
+          "prompt": "Explain in Spanish and Chinese how dynamic programming differs from greedy algorithms, and provide one example problem for each approach.",
+          "mlx_output_tokens": 200,
+          "mlx_decode_tps": 12.23874620985478,
+          "mlx_elapsed_s": 16.67195833400183,
+          "mlx_finish_reason": "length",
+          "mlx_output_preview": "Certainly! Here's a clear explanation in both **Spanish** and **Chinese**, followed by one example problem for each approach.\n\n---\n\n### \ufffd sp **Spanish**\n\n**Diferencia entre programaci\u00f3n din\u00e1mica y algoritmos greedy:**\n\n-",
+          "mlx_mean_logprob": -0.18521904468536377,
+          "mlx_perplexity": 1.2034820276000007
+        },
+        {
+          "prompt_id": "factual",
+          "prompt": "Give a concise timeline of major milestones in the development of modern transformer models from 2017 onward, with one sentence per milestone.",
+          "mlx_output_tokens": 200,
+          "mlx_decode_tps": 10.877720601000043,
+          "mlx_elapsed_s": 18.665019124993705,
+          "mlx_finish_reason": "length",
+          "mlx_output_preview": "1. **1970s\u20131990s**: Early neural language models (e.g., backpropagation, RNNs) laid foundational principles but struggled with long-range dependencies.  \n2. **2003**: Bengio et al. introduced the first neural language mo",
+          "mlx_mean_logprob": -0.4656645727157593,
+          "mlx_perplexity": 1.593072549720051
+        },
+        {
+          "prompt_id": "creative",
+          "prompt": "Write a short science-fiction scene where an engineer debugs a city-scale AI during a solar storm.",
+          "mlx_output_tokens": 200,
+          "mlx_decode_tps": 10.642374854625688,
+          "mlx_elapsed_s": 19.041745209004148,
+          "mlx_finish_reason": "length",
+          "mlx_output_preview": "**Scene: The Solar Storm**\n\nThe city of Aethel hummed under a bruised sky\u2014amber clouds churned overhead, charged with solar flares. Outside, the *Helios Array*\u2014a constellation of orbital mirrors\u2014flickered erratically, it",
+          "mlx_mean_logprob": -0.9731501293182373,
+          "mlx_perplexity": 2.64626742786639
+        }
+      ],
+      "num_experts": 512,
+      "pinning": "profile_universal",
+      "native_model_bytes_gb": 44.84406016,
+      "native_scoring_skipped_reason": "Native scoring skipped: estimated native model size 44.8 GB exceeds host memory budget 34.4 GB on this 32GB machine",
+      "model_avg_mlx_perplexity": 1.6646325937668025
+    },
+    {
+      "id": "qwen35_35b_a3b",
+      "model": "mlx-community/Qwen3.5-35B-A3B-4bit",
+      "capacity": 248,
+      "native_scoring": true,
+      "preflight": {
+        "base_gb": 20.423588972,
+        "expert_gb": 17.55316224,
+        "predicted_gb": 37.976751211999996,
+        "budget_gb": 32.6417514496,
+        "effective_capacity": 248,
+        "moe_layers": 40,
+        "num_experts": 256
+      },
+      "prompt_results": [],
+      "skipped_reason": "Skipped: estimated startup memory 38.0 GB exceeds budget 32.6 GB"
+    },
+    {
+      "id": "qwen35_122b_a10b",
+      "model": "mlx-community/Qwen3.5-122B-A10B-4bit",
+      "capacity": 68,
+      "native_scoring": false,
+      "preflight": {
+        "base_gb": 22.506939564,
+        "expert_gb": 17.326669824,
+        "predicted_gb": 39.833609388,
+        "budget_gb": 32.6417514496,
+        "effective_capacity": 68,
+        "moe_layers": 48,
+        "num_experts": 256
+      },
+      "prompt_results": [],
+      "skipped_reason": "Skipped: estimated startup memory 39.8 GB exceeds budget 32.6 GB"
+    }
+  ]
+}

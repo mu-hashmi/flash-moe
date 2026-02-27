@@ -1,0 +1,44 @@
+{
+  "generated_at": "2026-02-27T20:48:15.011892+00:00",
+  "model": "mlx-community/Qwen3.5-35B-A3B-4bit",
+  "capacity": 248,
+  "prompt": "Implement a production-ready Python rate limiter middleware for FastAPI with Redis backing, sliding-window counters, and structured error responses. Include unit tests.",
+  "tokens": 500,
+  "results": [
+    {
+      "status": "ok",
+      "pin_top_k": 0,
+      "generated_tokens": 500,
+      "decode_tps": 51.87229549203137,
+      "fallback_rate": 0.001829118585808986,
+      "repetition_score_300": 0.01683501683501687,
+      "repetition_score_500": 0.07847082494969815,
+      "output_preview": "This is a comprehensive request for implementing a production-ready rate limiter middleware for FastAPI. I need to create:\n\n1. A rate limiter middleware with Redis backing\n2. Sliding window algorithm implementation\n3. St"
+    },
+    {
+      "status": "ok",
+      "pin_top_k": 32,
+      "generated_tokens": 500,
+      "decode_tps": 51.12183044240809,
+      "fallback_rate": 0.0020930518045666584,
+      "repetition_score_300": 0.026936026936026924,
+      "repetition_score_500": 0.07444668008048294,
+      "output_preview": "This is a comprehensive request for implementing a production-ready rate limiter middleware for FastAPI. I need to create:\n\n1. A rate limiter middleware with Redis backing\n2. Sliding window algorithm implementation\n3. St"
+    },
+    {
+      "status": "ok",
+      "pin_top_k": 64,
+      "generated_tokens": 500,
+      "decode_tps": 51.09128385343132,
+      "fallback_rate": 0.0021422082545606326,
+      "repetition_score_300": 0.026936026936026924,
+      "repetition_score_500": 0.046277665995975825,
+      "output_preview": "This is a comprehensive request for implementing a production-ready rate limiter middleware for FastAPI. I need to create:\n\n1. A rate limiter middleware with Redis backing\n2. Sliding window algorithm implementation\n3. St"
+    }
+  ],
+  "spreads": {
+    "decode_tps_relative_spread": 0.015056431013738882,
+    "fallback_rate_abs_spread": 0.0003130896687516466,
+    "repetition_500_abs_spread": 0.03219315895372232
+  }
+}
