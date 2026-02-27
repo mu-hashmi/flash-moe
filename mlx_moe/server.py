@@ -29,9 +29,10 @@ def _find_profile(model_name: str, profiles_dir: Path | None = None) -> str | No
     if not profiles_dir.is_dir():
         return None
     model_slug = model_name.split("/")[-1].lower()
-    candidate = profiles_dir / f"{model_slug}.json"
-    if candidate.is_file():
-        return str(candidate)
+    for name in (f"{model_slug}-toolchat.json", f"{model_slug}.json"):
+        candidate = profiles_dir / name
+        if candidate.is_file():
+            return str(candidate)
     return None
 
 

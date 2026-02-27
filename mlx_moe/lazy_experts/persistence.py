@@ -186,7 +186,7 @@ def load_prepacked_weights(model, prepacked_path: str | Path,
     for layer_str, layer_meta in meta["layers"].items():
         i = int(layer_str)
         layer = model.layers[i]
-        switch, key_base = _find_switch_mlp(layer, i)
+        switch, key_base = _find_switch_mlp(layer, i, shard_map=shard_map)
         if switch is None:
             continue
 
@@ -237,6 +237,7 @@ def load_prepacked_weights(model, prepacked_path: str | Path,
                 proj_name=proj_name,
                 cache=pred_cache,
             )
+            replacement.num_experts = pred_cache.num_experts
             setattr(switch, proj_name, replacement)
             upgraded += 1
 

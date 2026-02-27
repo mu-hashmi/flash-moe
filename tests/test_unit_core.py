@@ -314,6 +314,17 @@ class TestFindSwitchMlp:
         found, _ = _find_switch_mlp(layer, layer_idx=0)
         assert found is switch_q
 
+    def test_resolves_language_model_root_with_shard_map(self):
+        switch = SimpleNamespace()
+        mlp = SimpleNamespace(switch_mlp=switch)
+        layer = SimpleNamespace(mlp=mlp)
+        shard_map = {
+            "language_model.model.layers.2.mlp.switch_mlp.gate_proj.weight": "x.safetensors"
+        }
+        found, prefix = _find_switch_mlp(layer, layer_idx=2, shard_map=shard_map)
+        assert found is switch
+        assert prefix == "language_model.model.layers.2.mlp.switch_mlp"
+
 
 class TestFindMoeBlock:
 
@@ -361,14 +372,16 @@ class TestDetectNumExperts:
         switch = SimpleNamespace(gate_proj=gate, up_proj=up)
         assert _detect_num_experts(switch) == 64
 
-    def test_fallback_512(self):
+    def test_raises_without_projection_metadata(self):
         switch = SimpleNamespace()
-        assert _detect_num_experts(switch) == 512
+        with pytest.raises(ValueError, match="Could not detect num_experts"):
+            _detect_num_experts(switch)
 
-    def test_no_num_experts_attr(self):
+    def test_raises_when_proj_missing_num_experts(self):
         gate = SimpleNamespace()  # has no num_experts
         switch = SimpleNamespace(gate_proj=gate)
-        assert _detect_num_experts(switch) == 512
+        with pytest.raises(ValueError, match="Could not detect num_experts"):
+            _detect_num_experts(switch)
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,39 @@ import mlx.core as mx
 import numpy as np
 
 
-def _find_switch_mlp(layer, layer_idx=None):
+def _resolve_key_base(
+    layer_idx: int,
+    moe_suffix: str,
+    shard_map: dict[str, str] | None,
+) -> str:
+    default = f"model.layers.{layer_idx}.{moe_suffix}"
+    if shard_map is None:
+        return default
+
+    probe = f"{default}.gate_proj.weight"
+    if probe in shard_map:
+        return default
+
+    for root in (
+        "language_model.model.layers",
+        "language_model.layers",
+        "model.model.layers",
+    ):
+        candidate = f"{root}.{layer_idx}.{moe_suffix}"
+        if f"{candidate}.gate_proj.weight" in shard_map:
+            return candidate
+
+    needle = f".layers.{layer_idx}.{moe_suffix}.gate_proj.weight"
+    matches = [k for k in shard_map if k.endswith(needle)]
+    if len(matches) == 1:
+        return matches[0].removesuffix(".gate_proj.weight")
+
+    raise KeyError(
+        f"Unable to resolve shard key base for layer {layer_idx} suffix '{moe_suffix}'"
+    )
+
+
+def _find_switch_mlp(layer, layer_idx=None, shard_map: dict[str, str] | None = None):
     """Find the SwitchGLU module in a model layer, supporting multiple architectures.
 
     Returns (switch_mlp, key_prefix_base) or (None, None) if not an MoE layer.
@@ -19,16 +51,22 @@ def _find_switch_mlp(layer, layer_idx=None):
       - layer.mlp.switch_mlp (Qwen, DeepSeek, GLM, Hunyuan, Jamba, OLMoE)
       - layer.block_sparse_moe.switch_mlp (Mixtral, PhiMoE, MiniMax, GraniteMoE)
     """
-    prefix = f"model.layers.{layer_idx}" if layer_idx is not None else None
-
     if hasattr(layer, "mlp") and hasattr(layer.mlp, "switch_mlp"):
         switch = layer.mlp.switch_mlp
-        key_base = f"{prefix}.mlp.switch_mlp" if prefix else "mlp.switch_mlp"
+        if layer_idx is not None:
+            key_base = _resolve_key_base(layer_idx, "mlp.switch_mlp", shard_map)
+        else:
+            key_base = "mlp.switch_mlp"
         return switch, key_base
 
     if hasattr(layer, "block_sparse_moe") and hasattr(layer.block_sparse_moe, "switch_mlp"):
         switch = layer.block_sparse_moe.switch_mlp
-        key_base = f"{prefix}.block_sparse_moe.switch_mlp" if prefix else "block_sparse_moe.switch_mlp"
+        if layer_idx is not None:
+            key_base = _resolve_key_base(
+                layer_idx, "block_sparse_moe.switch_mlp", shard_map
+            )
+        else:
+            key_base = "block_sparse_moe.switch_mlp"
         return switch, key_base
 
     return None, None
@@ -51,9 +89,30 @@ def _detect_num_experts(switch_mlp) -> int:
     """Detect number of experts from a SwitchGLU module."""
     for name in ("gate_proj", "up_proj", "down_proj"):
         proj = getattr(switch_mlp, name, None)
-        if proj is not None and hasattr(proj, "num_experts"):
-            return proj.num_experts
-    return 512
+        if proj is None:
+            continue
+        if hasattr(proj, "num_experts"):
+            return int(proj.num_experts)
+
+        cache = getattr(proj, "_cache", None)
+        if cache is not None and hasattr(cache, "num_experts"):
+            return int(cache.num_experts)
+
+        weight = getattr(proj, "weight", None)
+        if weight is not None and hasattr(weight, "shape") and len(weight.shape) >= 1:
+            return int(weight.shape[0])
+
+    for name in ("num_experts", "num_local_experts"):
+        if hasattr(switch_mlp, name):
+            return int(getattr(switch_mlp, name))
+
+    gate = getattr(switch_mlp, "gate", None)
+    if gate is not None and hasattr(gate, "weight"):
+        gate_weight = gate.weight
+        if hasattr(gate_weight, "shape") and len(gate_weight.shape) >= 1:
+            return int(gate_weight.shape[0])
+
+    raise ValueError(f"Could not detect num_experts from {type(switch_mlp).__name__}")
 
 
 def _build_shard_map(model_path: Path) -> dict[str, str]:

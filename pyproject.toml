@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "mlx>=0.22.0",
-    "mlx-lm>=0.30.0",
+    "mlx-lm>=0.30.7",
     "numpy>=2.0.0",
     "starlette>=0.46.0",
     "uvicorn>=0.34.0",

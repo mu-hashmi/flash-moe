@@ -31,6 +31,28 @@ from .persistence import (
 _WARMUP_CACHE = 256 * 1024 * 1024
 
 
+def _load_model_and_tokenizer(model_name: str, lazy: bool = True):
+    import mlx_lm as _mlx_lm
+    from mlx_lm.utils import _download, hf_repo_to_path, load_model, load_tokenizer
+
+    try:
+        model, tokenizer = _mlx_lm.load(model_name, lazy=lazy)
+        model_path = hf_repo_to_path(model_name)
+        return model, tokenizer, model_path
+    except ValueError as exc:
+        msg = str(exc)
+        if "parameters not in model" not in msg or "vision_tower" not in msg:
+            raise
+        model_path = Path(_download(model_name))
+        model, config = load_model(model_path, lazy=lazy, strict=False)
+        tokenizer = load_tokenizer(
+            model_path,
+            eos_token_ids=config.get("eos_token_id", None),
+        )
+        print("  [mlx-lm strict load failed due extra vision_tower weights; retrying strict=False]")
+        return model, tokenizer, model_path
+
+
 def _startup(
     model_name,
     prompt,
@@ -52,14 +74,11 @@ def _startup(
     Returns (model, tokenizer, model_path) with all warmup/upgrade/wiring done.
     """
     from .core import upgrade_to_predictive
-    import mlx_lm as _mlx_lm
-    from mlx_lm.utils import hf_repo_to_path
 
     t_total_start = time.perf_counter()
 
-    model_path = hf_repo_to_path(model_name)
     t0 = time.perf_counter()
-    model, tokenizer = _mlx_lm.load(model_name, lazy=True)
+    model, tokenizer, model_path = _load_model_and_tokenizer(model_name, lazy=True)
 
     # Detect MoE architecture
     num_moe_layers = 0

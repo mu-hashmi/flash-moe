@@ -24,7 +24,6 @@ from pathlib import Path
 import mlx.core as mx
 import mlx_lm
 import numpy as np
-from mlx_lm.utils import hf_repo_to_path
 from tool_chat_scenarios import get_profile_scenarios, render_scenario_prompt
 from mlx_moe.lazy_experts import (
     enable_lazy_experts, upgrade_to_predictive, reset_to_cached,
@@ -32,9 +31,13 @@ from mlx_moe.lazy_experts import (
     _find_switch_mlp, _detect_num_experts,
     CachedQuantizedSwitchLinear, PredictiveCachedSwitchLinear,
 )
+from mlx_moe.lazy_experts.generate import _load_model_and_tokenizer
 
 MODEL_PRESETS = {
     "qwen": ("mlx-community/Qwen3-Coder-Next-4bit", 208),
+    "qwen35-35b": ("mlx-community/Qwen3.5-35B-A3B-4bit", 144),
+    "qwen35-122b": ("mlx-community/Qwen3.5-122B-A10B-4bit", 72),
+    "qwen35-397b": ("mlx-community/Qwen3.5-397B-A17B-4bit", 48),
 }
 
 WARMUP_TOKENS = 10
@@ -105,14 +108,13 @@ PROMPT_PRESETS = {
 
 def apply_chat_template(tokenizer, text):
     """Wrap text in chat template if the tokenizer supports it."""
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(
-                [{"role": "user", "content": text}],
-                add_generation_prompt=True, tokenize=False)
-        except Exception:
-            pass
-    return text
+    if not getattr(tokenizer, "has_chat_template", False):
+        return text
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}],
+        add_generation_prompt=True,
+        tokenize=False,
+    )
 
 
 def collect_expert_activations(
@@ -238,7 +240,7 @@ def main():
     parser.add_argument("--threshold", "-t", type=float, default=0.5,
                         help="Fraction of prompts for 'universal' classification (default: 0.5)")
     parser.add_argument("--output", "-o", default=None,
-                        help="Output JSON path (default: <model>_experts.json)")
+                        help="Output JSON path (default: profiles/<model-slug>.json)")
     parser.add_argument("--prompts", "-p", choices=list(PROMPT_PRESETS.keys()),
                         default="diverse", help="Prompt preset (default: diverse)")
     parser.add_argument("--coding-weight", type=int, default=70,
@@ -255,15 +257,16 @@ def main():
 
     if args.model in MODEL_PRESETS:
         model_name, default_capacity = MODEL_PRESETS[args.model]
-        short_name = args.model
     else:
         model_name = args.model
         default_capacity = 208
-        short_name = model_name.split("/")[-1].lower()
 
+    model_slug = model_name.split("/")[-1].lower()
     capacity = args.capacity if args.capacity is not None else default_capacity
-    output_path = args.output or f"{short_name}_experts.json"
-    use_chat_template = args.model in ("mixtral", "glm", "qwen2-moe", "qwen3-30b") or "instruct" in model_name.lower()
+    default_name = (
+        f"{model_slug}-toolchat.json" if args.prompts == "tool-chat" else f"{model_slug}.json"
+    )
+    output_path = args.output or str(Path("profiles") / default_name)
     prompt_items = resolve_prompt_items(
         args.prompts,
         coding_weight=args.coding_weight,
@@ -275,9 +278,7 @@ def main():
         "router-only" if args.prompts in ("tool-chat", "mixed") else "warmup"
     )
 
-    model_path = hf_repo_to_path(model_name)
     print(f"Model: {model_name}")
-    print(f"Model path: {model_path}")
     print(f"Capacity: {capacity}, Threshold: {args.threshold}")
     print(f"Prompt preset: {args.prompts}")
     if args.prompts == "mixed":
@@ -286,11 +287,13 @@ def main():
             f"num_prompts={args.num_prompts} seed={args.seed}"
         )
     print(f"Discovery mode: {discovery_mode}")
-    print(f"Chat template (text presets): {use_chat_template}")
     print(f"Prompts: {len(prompt_items)}")
 
     print("Loading model with lazy=True...")
-    model, tokenizer = mlx_lm.load(model_name, lazy=True)
+    model, tokenizer, model_path = _load_model_and_tokenizer(model_name, lazy=True)
+    print(f"Model path: {model_path}")
+    use_chat_template = bool(getattr(tokenizer, "has_chat_template", False))
+    print(f"Chat template (text presets): {use_chat_template}")
 
     # Report model structure
     moe_layers = 0
@@ -374,6 +377,7 @@ def main():
         }
 
     output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2))
     print(f"\nResults saved to {output}")
 

@@ -4,7 +4,6 @@ from pathlib import Path
 
 import numpy as np
 import mlx.core as mx
-import mlx.nn as nn
 
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 from .loading import (
@@ -68,9 +67,10 @@ _SWITCH_LINEAR_TYPES = (
 def _enable_lazy(model, shard_map: dict) -> int:
     replaced = 0
     for i, layer in enumerate(model.layers):
-        switch, key_base = _find_switch_mlp(layer, i)
+        switch, key_base = _find_switch_mlp(layer, i, shard_map=shard_map)
         if switch is None:
             continue
+        num_experts = _detect_num_experts(switch)
         for name in ("gate_proj", "up_proj", "down_proj"):
             orig = getattr(switch, name)
             if not isinstance(orig, _SWITCH_LINEAR_TYPES):
@@ -85,6 +85,7 @@ def _enable_lazy(model, shard_map: dict) -> int:
                 mode=orig.mode,
                 shard_map=shard_map,
             )
+            replacement.num_experts = num_experts
             setattr(switch, name, replacement)
             replaced += 1
     return replaced
@@ -93,9 +94,10 @@ def _enable_lazy(model, shard_map: dict) -> int:
 def _enable_cached(model, shard_map: dict, capacity: int) -> int:
     replaced = 0
     for i, layer in enumerate(model.layers):
-        switch, key_base = _find_switch_mlp(layer, i)
+        switch, key_base = _find_switch_mlp(layer, i, shard_map=shard_map)
         if switch is None:
             continue
+        num_experts = _detect_num_experts(switch)
         layer_cache = ExpertCache(capacity)
         for name in ("gate_proj", "up_proj", "down_proj"):
             orig = getattr(switch, name)
@@ -113,6 +115,7 @@ def _enable_cached(model, shard_map: dict, capacity: int) -> int:
                 cache=layer_cache,
                 shard_map=shard_map,
             )
+            replacement.num_experts = num_experts
             setattr(switch, name, replacement)
             replaced += 1
     return replaced
@@ -143,13 +146,14 @@ def reset_to_cached(model, model_path: Path, capacity: int) -> int:
 
     reset = 0
     for i, layer in enumerate(model.layers):
-        switch, key_base = _find_switch_mlp(layer, i)
+        switch, key_base = _find_switch_mlp(layer, i, shard_map=shard_map)
         if switch is None:
             continue
         first = getattr(switch, "gate_proj")
         if not isinstance(first, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)):
             continue
 
+        num_experts = first._cache.num_experts
         layer_cache = ExpertCache(capacity)
         for name in ("gate_proj", "up_proj", "down_proj"):
             pred_mod = getattr(switch, name)
@@ -165,6 +169,7 @@ def reset_to_cached(model, model_path: Path, capacity: int) -> int:
                 cache=layer_cache,
                 shard_map=shard_map,
             )
+            replacement.num_experts = num_experts
             setattr(switch, name, replacement)
             reset += 1
 
@@ -206,7 +211,7 @@ def upgrade_to_predictive(
     moe_idx = 0
 
     for i, layer in enumerate(model.layers):
-        switch, key_base = _find_switch_mlp(layer, i)
+        switch, key_base = _find_switch_mlp(layer, i, shard_map=shard_map)
         if switch is None:
             continue
         first_proj = getattr(switch, "gate_proj")
@@ -358,6 +363,7 @@ def upgrade_to_predictive(
                 proj_name=name,
                 cache=pred_cache,
             )
+            replacement.num_experts = pred_cache.num_experts
             setattr(switch, name, replacement)
             upgraded += 1
 
@@ -417,7 +423,7 @@ def upgrade_to_predictive_with_pinning(
     # Pass 1: harvest LCP caches with pinned experts in front
     layer_meta = {}
     for i, layer in enumerate(model.layers):
-        switch, key_base = _find_switch_mlp(layer, i)
+        switch, key_base = _find_switch_mlp(layer, i, shard_map=shard_map)
         if switch is None:
             continue
         first_proj = getattr(switch, "gate_proj")
@@ -572,6 +578,7 @@ def upgrade_to_predictive_with_pinning(
                 proj_name=name,
                 cache=pred_cache,
             )
+            replacement.num_experts = pred_cache.num_experts
             setattr(switch, name, replacement)
             upgraded += 1
 
@@ -823,13 +830,12 @@ def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
       - Standard (Qwen, Mixtral): gate returns raw logits
       - GLM-style: gate returns (inds, scores) tuple directly
     """
-    gate_returns_tuple = _gate_returns_tuple(moe_block)
-
     def patched_call(self, x):
-        if gate_returns_tuple:
-            inds, scores = self.gate(x)
+        gate_out = self.gate(x)
+        if isinstance(gate_out, tuple):
+            inds, scores = gate_out
         else:
-            gates = self.gate(x)
+            gates = gate_out
             k = getattr(self, "num_experts_per_tok", getattr(self, "top_k", 2))
             gates = mx.softmax(gates, axis=-1, precise=True)
             inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
@@ -855,13 +861,6 @@ def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
 
     import types
     moe_block.__call__ = types.MethodType(patched_call, moe_block)
-
-
-def _gate_returns_tuple(moe_block) -> bool:
-    """Check if the gate returns (inds, scores) tuple vs raw logits."""
-    gate = moe_block.gate
-    # GLM's MoEGate returns a tuple; standard nn.Linear returns an array
-    return not isinstance(gate, nn.Linear)
 
 
 def get_fallback_stats(model) -> dict:

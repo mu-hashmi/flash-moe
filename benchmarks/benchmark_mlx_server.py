@@ -486,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark mlx-moe server with streamed output and telemetry capture")
     p.add_argument("--model", default="mlx-community/Qwen3-Coder-Next-4bit")
     p.add_argument("--profile", default=None)
-    p.add_argument("--capacity", type=int, default=208)
+    p.add_argument("--capacity", type=int, default=None)
     p.add_argument("--pin-top-k", type=int, default=None)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)

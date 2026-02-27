@@ -207,7 +207,7 @@ def _start_server(
     model_name: str,
     profile_path: Path,
     pin_top_k: int,
-    capacity: int,
+    capacity: int | None,
     port: int,
     warmup: str,
     startup_timeout_s: int,
@@ -223,8 +223,6 @@ def _start_server(
         "127.0.0.1",
         "--port",
         str(port),
-        "--capacity",
-        str(capacity),
         "--profile",
         str(profile_path),
         "--pin-top-k",
@@ -232,6 +230,8 @@ def _start_server(
         "--warmup",
         warmup,
     ]
+    if capacity is not None:
+        cmd.extend(["--capacity", str(capacity)])
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -433,7 +433,7 @@ def _run_candidate(
     model_name: str,
     profile_path: Path,
     pin_top_k: int,
-    capacity: int,
+    capacity: int | None,
     warmup: str,
     port: int,
     requests_data: list[dict],
@@ -508,7 +508,7 @@ def _profile_filename(model_name: str, coding: int, toolchat: int) -> str:
 
 def _generate_profile(
     model_name: str,
-    capacity: int,
+    capacity: int | None,
     threshold: float,
     coding: int,
     toolchat: int,
@@ -522,8 +522,6 @@ def _generate_profile(
         "benchmarks/profile_experts.py",
         "--model",
         model_name,
-        "--capacity",
-        str(capacity),
         "--threshold",
         str(threshold),
         "--prompts",
@@ -539,6 +537,8 @@ def _generate_profile(
         "--output",
         str(output_path),
     ]
+    if capacity is not None:
+        cmd.extend(["--capacity", str(capacity)])
     _print_line(f"\n[profile] generating {output_path.name} ...", run_logger)
     proc = subprocess.Popen(
         cmd,
@@ -624,7 +624,7 @@ def _write_summary_md(output_path: Path, candidates: list[dict], winner: dict | 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sweep profile mixes and pin_top_k values.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--capacity", type=int, default=208)
+    parser.add_argument("--capacity", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--mixes", default="70:30,50:50,30:70")
     parser.add_argument("--pin-counts", default="0,16,32,48,64")

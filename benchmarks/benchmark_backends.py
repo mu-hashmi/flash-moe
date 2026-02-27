@@ -175,6 +175,7 @@ def build_messages(system_prompt: str, turn: int) -> list[dict[str, str]]:
 def build_payload(
     *,
     turn: int,
+    model_id: str,
     tools: list[dict[str, Any]],
     system_prompt: str,
     use_tools_field: bool,
@@ -183,7 +184,7 @@ def build_payload(
     cache_prompt: bool,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "model": "qwen3-coder-next-4bit",
+        "model": model_id,
         "messages": build_messages(system_prompt, turn),
         "temperature": 0.2,
         "top_p": 0.95,
@@ -549,6 +550,10 @@ def run_backend(
     time.sleep(1)
 
     with httpx.Client(timeout=None) as client:
+        model_resp = client.get(f"{server.spec.base_url}/v1/models", timeout=30)
+        model_resp.raise_for_status()
+        model_id = model_resp.json()["data"][0]["id"]
+
         for mode in MODES:
             for trial in range(1, TRIALS + 1):
                 if mode == "reuse":
@@ -568,6 +573,7 @@ def run_backend(
                 for turn in turns:
                     payload = build_payload(
                         turn=turn,
+                        model_id=model_id,
                         tools=tools,
                         system_prompt=system_prompt,
                         use_tools_field=use_tools_field,
